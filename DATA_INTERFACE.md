@@ -154,7 +154,8 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
         // "no_discord_event" | "reminder_missing" | "event_not_started" | "tracking_missing" (nur CS)
         // reminder_missing wird NUR im 0-30-Min-Fenster vor Kickoff geflaggt (0 < time_to_start <= 1800);
         // bereits gestartete Matches werden nie als reminder_missing alarmiert.
-        // jedes erkannte Issue wird zusätzlich als log.error geloggt (taucht im Fehler-Log-Graphen auf)
+        // jedes erkannte Issue wird zusätzlich als log.warning geloggt (dedupliziert,
+        // nur bei Änderung des Issue-Sets — taucht im Fehler-Log-Graphen als WARNING auf)
         "issues": []
       }
     ],

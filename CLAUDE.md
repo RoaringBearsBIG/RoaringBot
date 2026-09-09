@@ -53,6 +53,11 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 - Ein Scheduled-Event pro neuem, nicht-cancellten Match.
 - Startzeit = Kickoff − 5 min (geclampt auf now+30s). Großzügiges
   `scheduled_end_time` (90 min/Map + 90 min Puffer) — nur für Discord-nötig.
+- Events werden **auch für bereits gestartete (live) Matches** erstellt —
+  die Creation wird nur für `has_ended`-Matches übersprungen (Sep-2026:
+  "BIG Academy vs. Morrow" wurde nach spätem API-Discovery nie angelegt →
+  dauerhafter Health-Error-Spam). Start wird auf now+30s geclampt, der Event
+  startet beim nächsten Poll automatisch.
 - Voice-Events wenn API `block_voice_channel` "VC 1"/"VC 2" + Env-Vars gesetzt.
 - Event-Description: `[wannspieltbig](detail_url)` und `🔗 [HLTV](hltv_url)` (CS-only)
   in **einer Zeile** durch ` • ` getrennt — kein Zeilenumbruch zwischen den Links.
@@ -74,7 +79,15 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 
 **CS Livescore-Tracking:**
 - Startet 4–5 min vor jedem CS-Match automatisch (kein manueller Befehl).
-- CV2-Score-Message mit Round-Score, Map-Tabelle, Admin-Buttons.
+- **Belt-and-Suspenders**: `_check_for_starting_matches` startet Tracking auch für
+  bereits gestartete (live), noch nicht getrackte Matches (`time_to_start < 240`,
+  `not has_ended`, Relevance-Regel wie Health-Check) — deckt Restart-mitten-im-
+  Match, spätes API-Discovery und Match-ID-Reuse ab. Ohne das wurde ein live
+  Match nie getrackt → keine Scores, kein Event-Name-Update.
+- CV2-Score-Message mit Round-Score, Map-Tabelle, **Scorekeeper-Buttons**.
+- **Berechtigung**: Score-Buttons erlauben Admins UND User mit der Role
+  `SCORE_UPDATE_ROLE_ID` (1278991041172602882) via `_can_manage_score()`;
+  alle anderen sind read-only (Sep-2026: chrissimz wurde abgelehnt).
 - Korrekte OT-Regeln (12-12 → first to 16, 15-15 → 19, …).
 - Jede Änderung wird via PUT an `wannspieltbig.de/api/matchmap_update/<id>/`
   zurückgeschrieben (Basic Auth: `WSB_User`/`WSB_PW` — exakte Schreibweise!).
@@ -87,6 +100,16 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   als `bra71l` angezeigt statt `7:1`; alle anderen Scores bleiben normal.
 - 30-s `live_score_updater`-Loop synct von `/api/match_livescore/` und erkennt
   Finish → Winner-Rendering, Event beendet, Tracker entfernt.
+- **Main-Poll-has_ended-Fallback**: Der Livescore-Feed enthält Academy-Matches
+  oft gar nicht (Sep-2026: 2361/2365/2367 blieben ewig bei 0-0 hängen). Wenn ein
+  getrackter Match im Feed fehlt, synct der Loop die Matchmaps aus dem
+  `match_upcoming`-Poll (`_compute_map_scores`, enthält auch Final-Scores) und
+  beendet den Tracker bei `has_ended=True` (geguardet: erst ≥ 15 min nach Start,
+  damit ein verfrühtes has_ended keinen laufenden Match killt). Damit rendert das
+  Winner-State den echten Sieger (z. B. 0-2) statt "0-0".
+- **Cancelled-Cleanup**: `_handle_match_cancelled` + Startup-Sweep in
+  `_process_match_updates` löschen Score-Message und Tracker für gecancelte
+  Matches (`_remove_cs_tracker`) — sonst bliebe eine 0-0-Message ewig stehen.
 - Tracker überleben Restarts via Postgres; Map-History ist In-Memory (wird in
   ≤ 30 s aus API neu aufgebaut).
 

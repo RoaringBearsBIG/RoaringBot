@@ -60,6 +60,13 @@ class EsportsMatch:
 
         self.start_time = _parse_wsb_local_time(match_data["first_map_at"])
 
+        # wannspieltbig marks a match as finished via has_ended in the main
+        # match_upcoming poll. Unlike the livescore feed's has_ended (which is
+        # occasionally premature and only covers followed matches anyway), this
+        # flag is authoritative enough to finish trackers whose matches never
+        # appear in the livescore feed at all (e.g. academy fixtures).
+        self.has_ended = bool(match_data.get("has_ended", False))
+
         # last_map_end is different: verified live, it always comes back with
         # a genuine "Z" (real UTC) suffix, and is a coarse scheduling estimate
         # (~start + 1h per best-of map), not a mislabeled local time. Trust
@@ -263,6 +270,57 @@ class CSGameTracker:
 
 CS_EMOTE = "<:cs:1416235161594499092>"
 GAME_EMOJI = {"cs": CS_EMOTE, "lol": "<:lol:1416235138307854416>", "tm": "🏎️"}
+
+# Role allowed to update live CS scores via the score-message buttons, in
+# addition to guild administrators. Everyone else is read-only.
+SCORE_UPDATE_ROLE_ID = 1278991041172602882
+
+
+def _compute_map_scores(matchmaps: List[dict], team_a: str, team_b: str):
+    """Reduce a match's matchmaps list into (team_a_maps, team_b_maps,
+    current_map_idx, api_history), where current_map_idx is the 0-based
+    index of the first map that is not finished yet (== len(matchmaps) when
+    every map is done). A map is finished only when the leader has reached
+    the escalation target (13 regulation, 16/19/22… in overtime). Shared by
+    the livescore sync loop and the main-poll fallback."""
+    team_a_maps = 0
+    team_b_maps = 0
+    current_map_idx = 0
+    api_history = []  # completed maps, feeds the score message's map table
+
+    for i, mm in enumerate(matchmaps):
+        rounds_a = mm.get("rounds_won_team_a", 0) or 0
+        rounds_b = mm.get("rounds_won_team_b", 0) or 0
+
+        # A map is finished only when the leader has reached the current
+        # target score: 13 in regulation, then 16, 19, 22,… in overtime.
+        # The target escalates while the trailing team keeps within one
+        # round of it (12:12 -> first to 16, 15:15 -> first to 19, …) — an
+        # intermediate OT score like 17:15 is NOT a finished map.
+        leader = max(rounds_a, rounds_b)
+        trailer = min(rounds_a, rounds_b)
+        target = 13
+        while trailer >= target - 1:
+            target += 3
+        map_finished = leader >= target
+
+        if not map_finished:
+            current_map_idx = i
+            break
+        else:
+            if rounds_a > rounds_b:
+                team_a_maps += 1
+            else:
+                team_b_maps += 1
+            api_history.append({
+                "map": i + 1,
+                "name": (mm.get("played_map") or {}).get("name"),
+                "score": f"{rounds_a}:{rounds_b}",
+                "winner": team_a if rounds_a > rounds_b else team_b,
+            })
+            current_map_idx = i + 1
+
+    return team_a_maps, team_b_maps, current_map_idx, api_history
 
 
 EVENT_COVER_H = 640  # 1600×640 = 2.5:1 — Discord event header shows covers at ~2.5:1 (800×320)
@@ -475,9 +533,9 @@ class MapConfirmationView(discord.ui.LayoutView):
 
     async def confirm_callback(self, interaction: discord.Interaction):
         """Confirm the map is finished"""
-        if not interaction.user.guild_permissions.administrator:
-            self.esports_cog.log.warning(f"Button rejected: {interaction.user} (no admin) tried to confirm map {self.tracker.current_map} in match {self.tracker.match.id}")
-            await interaction.response.send_message("❌ Only administrators can confirm map results.", ephemeral=True)
+        if not self.esports_cog._can_manage_score(interaction.user):
+            self.esports_cog.log.warning(f"Button rejected: {interaction.user} (no admin/score role) tried to confirm map {self.tracker.current_map} in match {self.tracker.match.id}")
+            await interaction.response.send_message("❌ Only administrators and scorekeepers can confirm map results.", ephemeral=True)
             return
 
         self.esports_cog.log.info(f"Button: {interaction.user} confirmed map {self.tracker.current_map} win for {self.winning_team} (match {self.tracker.match.id})")
@@ -493,9 +551,9 @@ class MapConfirmationView(discord.ui.LayoutView):
 
     async def cancel_callback(self, interaction: discord.Interaction):
         """Cancel map confirmation and continue playing"""
-        if not interaction.user.guild_permissions.administrator:
-            self.esports_cog.log.warning(f"Button rejected: {interaction.user} (no admin) tried to cancel map confirmation in match {self.tracker.match.id}")
-            await interaction.response.send_message("❌ Only administrators can modify map results.", ephemeral=True)
+        if not self.esports_cog._can_manage_score(interaction.user):
+            self.esports_cog.log.warning(f"Button rejected: {interaction.user} (no admin/score role) tried to cancel map confirmation in match {self.tracker.match.id}")
+            await interaction.response.send_message("❌ Only administrators and scorekeepers can modify map results.", ephemeral=True)
             return
 
         self.esports_cog.log.info(f"Button: {interaction.user} cancelled map {self.tracker.current_map} confirmation (match {self.tracker.match.id}) - continuing play")
@@ -638,9 +696,9 @@ class ScoreUpdateView(discord.ui.LayoutView):
 
     async def team_a_callback(self, interaction: discord.Interaction):
         """Handle team A round win"""
-        if not interaction.user.guild_permissions.administrator:
-            self.esports_cog.log.warning(f"Button rejected: {interaction.user} (no admin) tried to add round for {self.tracker.match.team_a} in match {self.tracker.match.id}")
-            await interaction.response.send_message("❌ Only administrators can update scores.", ephemeral=True)
+        if not self.esports_cog._can_manage_score(interaction.user):
+            self.esports_cog.log.warning(f"Button rejected: {interaction.user} (no admin/score role) tried to add round for {self.tracker.match.team_a} in match {self.tracker.match.id}")
+            await interaction.response.send_message("❌ Only administrators and scorekeepers can update scores.", ephemeral=True)
             return
 
         self.esports_cog.log.info(f"Button: {interaction.user} added round for {self.tracker.match.team_a} (match {self.tracker.match.id}, map {self.tracker.current_map}, score {self.tracker.team_a_score}-{self.tracker.team_b_score})")
@@ -663,9 +721,9 @@ class ScoreUpdateView(discord.ui.LayoutView):
 
     async def team_b_callback(self, interaction: discord.Interaction):
         """Handle team B round win"""
-        if not interaction.user.guild_permissions.administrator:
-            self.esports_cog.log.warning(f"Button rejected: {interaction.user} (no admin) tried to add round for {self.tracker.match.team_b} in match {self.tracker.match.id}")
-            await interaction.response.send_message("❌ Only administrators can update scores.", ephemeral=True)
+        if not self.esports_cog._can_manage_score(interaction.user):
+            self.esports_cog.log.warning(f"Button rejected: {interaction.user} (no admin/score role) tried to add round for {self.tracker.match.team_b} in match {self.tracker.match.id}")
+            await interaction.response.send_message("❌ Only administrators and scorekeepers can update scores.", ephemeral=True)
             return
 
         self.esports_cog.log.info(f"Button: {interaction.user} added round for {self.tracker.match.team_b} (match {self.tracker.match.id}, map {self.tracker.current_map}, score {self.tracker.team_a_score}-{self.tracker.team_b_score})")
@@ -688,9 +746,9 @@ class ScoreUpdateView(discord.ui.LayoutView):
 
     async def manual_score_callback(self, interaction: discord.Interaction):
         """Handle manual score input"""
-        if not interaction.user.guild_permissions.administrator:
-            self.esports_cog.log.warning(f"Button rejected: {interaction.user} (no admin) tried manual score for match {self.tracker.match.id}")
-            await interaction.response.send_message("❌ Only administrators can update scores.", ephemeral=True)
+        if not self.esports_cog._can_manage_score(interaction.user):
+            self.esports_cog.log.warning(f"Button rejected: {interaction.user} (no admin/score role) tried manual score for match {self.tracker.match.id}")
+            await interaction.response.send_message("❌ Only administrators and scorekeepers can update scores.", ephemeral=True)
             return
 
         self.esports_cog.log.info(f"Button: {interaction.user} opened manual score modal (match {self.tracker.match.id}, map {self.tracker.current_map})")
@@ -720,6 +778,7 @@ class EsportsCog(commands.Cog):
         self._event_status_by_match: Dict[int, discord.EventStatus] = {}  # match ID -> last observed Discord event status (this poll)
         self.summary_message_id: Optional[int] = None  # Latest summary message ID
         self._event_cover_version: int = 0  # persisted; reconciled covers re-uploaded when < EVENT_COVER_VERSION
+        self._last_health_issues: Dict[int, Tuple[str, ...]] = {}  # match ID -> last logged issue set (dedupe)
 
         # CS game tracking
         self.active_cs_games: Dict[int, CSGameTracker] = {}  # match ID -> tracker
@@ -1107,6 +1166,10 @@ class EsportsCog(commands.Cog):
         """Poll wannspieltbig API every 30s during active matches to sync scores"""
         try:
             if not self.active_cs_games:
+                # Keep the dashboard's cs_trackers field honest when the last
+                # tracker was just cleaned up (otherwise it shows stale 0-0
+                # trackers for matches that have already ended/cancelled).
+                status_reporter.record("esports", cs_trackers=[])
                 return  # No active games to update
 
             self.log.debug(f"Polling livescore API for {len(self.active_cs_games)} active games")
@@ -1131,6 +1194,8 @@ class EsportsCog(commands.Cog):
             if not matches_data:
                 return
 
+            now = datetime.now(timezone.utc)
+
             # Update scores for active games
             for match_id, tracker in list(self.active_cs_games.items()):
                 # Find this match in API data
@@ -1141,6 +1206,62 @@ class EsportsCog(commands.Cog):
                         break
 
                 if not api_match:
+                    # The livescore feed only covers matches wannspieltbig is
+                    # actively following — academy fixtures are often absent
+                    # entirely, so a missing entry is NOT a finish signal on its
+                    # own. Fall back to the main poll's data (refreshed into
+                    # self.matches every cycle): its matchmaps carry the final
+                    # scores even for matches never in the livescore feed. Sync
+                    # them into the tracker so the finished state shows the real
+                    # winner, then finish when the main poll reports has_ended.
+                    current = self.matches.get(match_id)
+                    if current is None:
+                        continue
+
+                    main_maps = _compute_map_scores(
+                        current.matchmaps, current.team_a, current.team_b
+                    )
+                    team_a_maps, team_b_maps, current_map_idx, api_history = main_maps
+                    scores_changed = False
+                    if api_history:
+                        tracker.map_history = api_history
+                    if team_a_maps != tracker.team_a_maps or team_b_maps != tracker.team_b_maps:
+                        tracker.team_a_maps = team_a_maps
+                        tracker.team_b_maps = team_b_maps
+                        scores_changed = True
+                    if current_map_idx < len(current.matchmaps):
+                        api_map = current.matchmaps[current_map_idx]
+                        new_map = current_map_idx + 1
+                        if new_map != tracker.current_map:
+                            tracker.current_map = new_map
+                            tracker.team_a_score = 0
+                            tracker.team_b_score = 0
+                            tracker.overtime_target = 13
+                            scores_changed = True
+                        a = api_map.get("rounds_won_team_a", 0) or 0
+                        b = api_map.get("rounds_won_team_b", 0) or 0
+                        if a != tracker.team_a_score or b != tracker.team_b_score:
+                            tracker.team_a_score = a
+                            tracker.team_b_score = b
+                            tracker._update_overtime_target()
+                            scores_changed = True
+
+                    should_finish = (current.has_ended and not tracker.is_finished
+                                     and now >= current.start_time + timedelta(minutes=15))
+                    if (scores_changed or should_finish) and tracker.message_id:
+                        await self._update_event_name_with_score(tracker)
+                        if should_finish:
+                            await self._finish_cs_tracker(match_id, tracker, "main-poll has_ended (not in livescore feed)")
+                        else:
+                            try:
+                                channel = self.bot.get_channel(config.esports_update_channel_id)
+                                if channel:
+                                    message = await channel.fetch_message(tracker.message_id)
+                                    await message.edit(view=ScoreUpdateView(tracker, self))
+                            except discord.NotFound:
+                                self.log.warning(f"Score update message {tracker.message_id} not found")
+                            except Exception as e:
+                                self.log.error(f"Error updating score message: {e}")
                     continue
 
                 # Check if match has ended according to API
@@ -1157,43 +1278,9 @@ class EsportsCog(commands.Cog):
                 tracker.match.matchmaps = matchmaps
 
                 # Calculate map scores from API data
-                team_a_maps = 0
-                team_b_maps = 0
-                current_map_idx = 0
-                api_history = []  # completed maps, feeds the score message's map table
-
-                for i, mm in enumerate(matchmaps):
-                    rounds_a = mm.get("rounds_won_team_a", 0) or 0
-                    rounds_b = mm.get("rounds_won_team_b", 0) or 0
-
-                    # A map is finished only when the leader has reached the
-                    # current target score: 13 in regulation, then 16, 19, 22,…
-                    # in overtime. The target escalates while the trailing team
-                    # keeps within one round of it (12:12 -> first to 16,
-                    # 15:15 -> first to 19, …) — an intermediate OT score like
-                    # 17:15 is NOT a finished map, even with a 2-round lead.
-                    leader = max(rounds_a, rounds_b)
-                    trailer = min(rounds_a, rounds_b)
-                    target = 13
-                    while trailer >= target - 1:
-                        target += 3
-                    map_finished = leader >= target
-
-                    if not map_finished:
-                        current_map_idx = i
-                        break
-                    else:
-                        if rounds_a > rounds_b:
-                            team_a_maps += 1
-                        else:
-                            team_b_maps += 1
-                        api_history.append({
-                            "map": i + 1,
-                            "name": (mm.get("played_map") or {}).get("name"),
-                            "score": f"{rounds_a}:{rounds_b}",
-                            "winner": tracker.match.team_a if rounds_a > rounds_b else tracker.match.team_b,
-                        })
-                        current_map_idx = i + 1
+                team_a_maps, team_b_maps, current_map_idx, api_history = _compute_map_scores(
+                    matchmaps, tracker.match.team_a, tracker.match.team_b
+                )
 
                 # API is the source of truth for completed maps (also restores
                 # the display-only history after a bot restart)
@@ -1242,40 +1329,45 @@ class EsportsCog(commands.Cog):
                 maps_to_win = (tracker.match.bestof + 1) // 2
                 map_score_finished = tracker.team_a_maps >= maps_to_win or tracker.team_b_maps >= maps_to_win
                 maps_played = tracker.team_a_maps + tracker.team_b_maps > 0
-                match_finished = map_score_finished or (has_ended and maps_played)
+
+                # Fallback finish signal from the main match_upcoming poll: the
+                # livescore feed only covers matches wannspieltbig is actively
+                # following (academy fixtures are often absent entirely), so a
+                # match can end without ever syncing a map score here. Guard with
+                # a minimum live duration so a premature has_ended can't kill a
+                # match that hasn't really started.
+                current = self.matches.get(match_id)
+                main_poll_ended = (
+                    current is not None and current.has_ended
+                    and now >= current.start_time + timedelta(minutes=15)
+                )
+                match_finished = map_score_finished or (has_ended and maps_played) or main_poll_ended
 
                 # Update Discord message and event name if scores changed or match finished
                 if (scores_changed or match_finished) and tracker.message_id:
                     await self._update_event_name_with_score(tracker)
-                    try:
-                        channel = self.bot.get_channel(config.esports_update_channel_id)
-                        if channel:
-                            message = await channel.fetch_message(tracker.message_id)
-
-                            if match_finished and not tracker.is_finished:
-                                tracker.is_finished = True
-                                # Winner rendering, no buttons (is_finished=True)
+                    if match_finished and not tracker.is_finished:
+                        # Winner rendering, no buttons (is_finished=True);
+                        # remove from active games and silence health checks
+                        # until the match leaves the API (the event and
+                        # tracker are already gone, so "no_discord_event"
+                        # and "tracking_missing" would fire every poll).
+                        await self._finish_cs_tracker(
+                            match_id, tracker,
+                            "API sync" if map_score_finished or (has_ended and maps_played) else "main-poll has_ended",
+                        )
+                    else:
+                        try:
+                            channel = self.bot.get_channel(config.esports_update_channel_id)
+                            if channel:
+                                message = await channel.fetch_message(tracker.message_id)
                                 await message.edit(view=ScoreUpdateView(tracker, self))
-                                self.log.info(f"Match {match_id} finished via API sync - "
-                                             f"{tracker.match.team_a} {tracker.team_a_maps}-{tracker.team_b_maps} {tracker.match.team_b}")
-
-                                # End the Discord event
-                                await self._end_match_event(tracker.match)
-
-                                # Remove from active games and silence health checks
-                                # until the match leaves the API (the event and
-                                # tracker are already gone, so "no_discord_event"
-                                # and "tracking_missing" would fire every poll).
+                        except discord.NotFound:
+                            self.log.warning(f"Score update message {tracker.message_id} not found")
+                            if match_id in self.active_cs_games:
                                 del self.active_cs_games[match_id]
-                                self._livescore_finished_ids.add(match_id)
-                            else:
-                                await message.edit(view=ScoreUpdateView(tracker, self))
-                    except discord.NotFound:
-                        self.log.warning(f"Score update message {tracker.message_id} not found")
-                        if match_id in self.active_cs_games:
-                            del self.active_cs_games[match_id]
-                    except Exception as e:
-                        self.log.error(f"Error updating score message: {e}")
+                        except Exception as e:
+                            self.log.error(f"Error updating score message: {e}")
 
             status_reporter.record(
                 "esports",
@@ -1302,6 +1394,35 @@ class EsportsCog(commands.Cog):
     async def before_live_score_updater(self):
         """Wait for bot to be ready before starting live score updater"""
         await self.bot.wait_until_ready()
+
+    async def _finish_cs_tracker(self, match_id: int, tracker: CSGameTracker, reason: str):
+        """Mark a tracker as finished, render the winner state (no buttons),
+        end the Discord event, and remove the tracker from active games.
+        Shared finish path for the livescore loop and the main-poll
+        has_ended fallback."""
+        tracker.is_finished = True
+
+        if tracker.message_id:
+            try:
+                channel = self.bot.get_channel(config.esports_update_channel_id)
+                if channel:
+                    message = await channel.fetch_message(tracker.message_id)
+                    await message.edit(view=ScoreUpdateView(tracker, self))
+            except discord.NotFound:
+                self.log.warning(f"Score update message {tracker.message_id} not found")
+            except Exception as e:
+                self.log.error(f"Error updating score message: {e}")
+
+        await self._end_match_event(tracker.match)
+
+        self.active_cs_games.pop(match_id, None)
+        self.monitored_matches.discard(match_id)
+        self._livescore_finished_ids.add(match_id)
+        self.log.info(
+            f"Match {match_id} finished via {reason} - "
+            f"{tracker.match.team_a} {tracker.team_a_maps}-{tracker.team_b_maps} {tracker.match.team_b}"
+        )
+        await self._save_data()
 
     async def _end_match_event(self, match: EsportsMatch):
         """End the Discord event for a finished match"""
@@ -1431,6 +1552,14 @@ class EsportsCog(commands.Cog):
                 if new_match.cancelled and not old_match.cancelled:
                     await self._handle_match_cancelled(new_match)
 
+        # Clean up stale trackers of matches that are already cancelled. The
+        # cancellation handler above only fires on the cancelled-transition
+        # (old_match not cancelled); a match that was cancelled while the bot
+        # was down would otherwise leave its 0-0 score message up forever.
+        for match_id, match in current_matches.items():
+            if match.cancelled and match_id in self.active_cs_games:
+                await self._remove_cs_tracker(match_id, "cancelled (startup sweep)")
+
         # Handle new and updated matches
         for match_id, match in current_matches.items():
             if match_id not in self.matches and match_id not in self.known_match_ids:
@@ -1452,8 +1581,10 @@ class EsportsCog(commands.Cog):
                         await self._edit_reminder_message(match)
                     # else: no reminder sent yet, will fire normally at 30-min mark
                     await self._update_discord_event(match)
-                elif not match.cancelled and not match.discord_event_id and match.start_time > datetime.now(timezone.utc):
-                    # Belt-and-suspenders: existing match lost its event (e.g., mapping cleared last cycle)
+                elif not match.cancelled and not match.discord_event_id and not match.has_ended:
+                    # Belt-and-suspenders: existing match lost its event (e.g., mapping cleared
+                    # last cycle). Also covers matches that were already live when first
+                    # discovered — _create_discord_event clamps the start to now+30s.
                     self.log.info(f"Existing match {match_id} ({match.event_name}) has no Discord event — recreating")
                     await self._create_discord_event(match)
         
@@ -1587,7 +1718,12 @@ class EsportsCog(commands.Cog):
                 issues.append("tracking_missing")
 
         if issues:
-            self.log.error(f"Match {match.id} ({match.event_name}) health issues: {', '.join(issues)}")
+            key = tuple(issues)
+            if self._last_health_issues.get(match.id) != key:
+                self._last_health_issues[match.id] = key
+                self.log.warning(f"Match {match.id} ({match.event_name}) health issues: {', '.join(issues)}")
+        else:
+            self._last_health_issues.pop(match.id, None)
         return issues
 
     def _compute_next_matches(self, matches: List["EsportsMatch"], now: datetime) -> list:
@@ -1707,9 +1843,15 @@ class EsportsCog(commands.Cog):
                 )
                 return
 
-            # Only create events for matches that haven't started yet
-            if match.start_time <= datetime.now(timezone.utc):
-                self.log.debug(f"Skipping event creation for past match {match.id}")
+            # Skip creation only for matches that have already ended. A match
+            # that has started but is still live (discovered late, or after a
+            # restart) still gets an event — its start time is clamped to
+            # now+30s by _event_api_start_time and the event auto-starts on
+            # the next poll. Skipping past-start matches entirely left live
+            # matches without any Discord presence (Sep-2026: "BIG Academy
+            # vs. Morrow" never got an event → permanent health-error spam).
+            if match.has_ended:
+                self.log.debug(f"Skipping event creation for ended match {match.id}")
                 return
             event_start_time = self._event_api_start_time(match)
             end_time = self._event_end_time(match)
@@ -1945,49 +2087,72 @@ class EsportsCog(commands.Cog):
         """Handle a cancelled match by deleting its Discord event"""
         self._record_match_event(match, "cancelled")
         try:
-            if not match.discord_event_id:
-                self.log.debug(f"No Discord event to cancel for match {match.id}")
-                return
-            
-            # Find and delete the event
-            if config.esports_guild_id:
-                # Use configured guild if specified
-                guild = self.bot.get_guild(config.esports_guild_id)
-                if guild:
-                    try:
-                        event = await guild.fetch_scheduled_event(match.discord_event_id)
-                        await event.delete()
-                        self.log.info(f"Deleted Discord event {match.discord_event_id} for cancelled match {match.id}")
-                    except discord.NotFound:
-                        self.log.debug(f"Event {match.discord_event_id} not found in configured guild")
-                    except Exception as e:
-                        self.log.error(f"Error deleting event from configured guild: {e}")
-            else:
-                # Search through all guilds (original behavior)
-                for guild in self.bot.guilds:
-                    try:
-                        event = await guild.fetch_scheduled_event(match.discord_event_id)
-                        await event.delete()
-                        
-                        self.log.info(f"Deleted Discord event {match.discord_event_id} for cancelled match {match.id}")
-                        break
-                        
-                    except discord.NotFound:
-                        continue
-                    except Exception as e:
-                        self.log.debug(f"Error deleting event from guild {guild.id}: {e}")
-                        continue
-            
-            # Clean up mappings
-            if match.discord_event_id in self.event_to_match:
-                del self.event_to_match[match.discord_event_id]
-            match.discord_event_id = None
-            
+            if match.discord_event_id:
+                # Find and delete the event
+                if config.esports_guild_id:
+                    # Use configured guild if specified
+                    guild = self.bot.get_guild(config.esports_guild_id)
+                    if guild:
+                        try:
+                            event = await guild.fetch_scheduled_event(match.discord_event_id)
+                            await event.delete()
+                            self.log.info(f"Deleted Discord event {match.discord_event_id} for cancelled match {match.id}")
+                        except discord.NotFound:
+                            self.log.debug(f"Event {match.discord_event_id} not found in configured guild")
+                        except Exception as e:
+                            self.log.error(f"Error deleting event from configured guild: {e}")
+                else:
+                    # Search through all guilds (original behavior)
+                    for guild in self.bot.guilds:
+                        try:
+                            event = await guild.fetch_scheduled_event(match.discord_event_id)
+                            await event.delete()
+
+                            self.log.info(f"Deleted Discord event {match.discord_event_id} for cancelled match {match.id}")
+                            break
+
+                        except discord.NotFound:
+                            continue
+                        except Exception as e:
+                            self.log.debug(f"Error deleting event from guild {guild.id}: {e}")
+                            continue
+
+                # Clean up mappings
+                if match.discord_event_id in self.event_to_match:
+                    del self.event_to_match[match.discord_event_id]
+                match.discord_event_id = None
+
             # Also clean up reminder message if it exists
             await self._cleanup_match_reminder(match)
-            
+
+            # Clean up CS game tracking if active (cancelled matches would
+            # otherwise leave a stale 0-0 score message and tracker forever).
+            await self._remove_cs_tracker(match.id, "cancelled")
+
         except Exception as e:
             self.log.error(f"Error handling cancelled match {match.id}: {e}")
+
+    async def _remove_cs_tracker(self, match_id: int, reason: str):
+        """Delete a tracked match's score message and drop its tracker.
+        Used for cancelled matches and for startup reconciliation of stale
+        trackers whose cancellation happened while the bot was down."""
+        tracker = self.active_cs_games.pop(match_id, None)
+        self.monitored_matches.discard(match_id)
+        if not tracker:
+            return
+        if tracker.message_id:
+            try:
+                channel = self.bot.get_channel(config.esports_update_channel_id)
+                if channel:
+                    message = await channel.fetch_message(tracker.message_id)
+                    await message.delete()
+                    self.log.info(f"Deleted score message {tracker.message_id} for match {match_id} ({reason})")
+            except discord.NotFound:
+                self.log.debug(f"Score message {tracker.message_id} for match {match_id} already gone ({reason})")
+            except Exception as e:
+                self.log.warning(f"Failed to delete score message {tracker.message_id}: {e}")
+        self.log.info(f"Removed CS tracker for match {match_id} ({reason})")
+        await self._save_data()
     
     async def _handle_match_finished(self, match: EsportsMatch):
         """Handle a finished match by ending its Discord event"""
@@ -2409,6 +2574,15 @@ class EsportsCog(commands.Cog):
         except Exception as e:
             self.log.warning(f"Failed to update event name with score for match {match.id}: {e}")
 
+    def _can_manage_score(self, user) -> bool:
+        """Whether *user* may update live CS scores: guild administrators and
+        members holding SCORE_UPDATE_ROLE_ID. Everyone else is read-only."""
+        if user is None:
+            return False
+        if getattr(user, "guild_permissions", None) and user.guild_permissions.administrator:
+            return True
+        return any(r.id == SCORE_UPDATE_ROLE_ID for r in getattr(user, "roles", []))
+
     async def _check_for_starting_matches(self):
         """Check if any CS matches are starting soon and create score trackers"""
         if not config.esports_update_channel_id:
@@ -2428,6 +2602,19 @@ class EsportsCog(commands.Cog):
                 if 240 <= time_to_start <= 300:  # 4-5 minutes
                     self.monitored_matches.add(match.id)
                     await self._start_cs_game_tracking(match)
+                elif time_to_start < 240 and not match.has_ended:
+                    # Belt-and-suspenders for matches that are already live (or
+                    # nearer than 4 minutes out) but have no tracker — e.g. the
+                    # bot restarted mid-match, the match was discovered late, or
+                    # match-id reuse skipped the T-5 window. Without this, a live
+                    # match would never get a score message or event-name scores.
+                    # Same relevance rule as _match_health_issues: the API's
+                    # end_time estimate is unreliable (too early), so give it a
+                    # 1h grace before giving up on a match.
+                    still_relevant = match.end_time is None or now < match.end_time + timedelta(hours=1)
+                    if still_relevant:
+                        self.monitored_matches.add(match.id)
+                        await self._start_cs_game_tracking(match)
     
     # Sentinel returned by _find_alternative_vc when both VCs are occupied.
     _VC_BLOCKED = object()
