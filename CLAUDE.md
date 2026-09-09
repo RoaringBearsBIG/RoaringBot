@@ -160,6 +160,13 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   (`big.png` + Opponent-Logo-URL).
 - **Ping-Card (CS-Large-Role-Workaround)**: CV2-Karte im Summary-Channel mit
   "Match Thread"-Button, umgeht Discords 250-Member-Thread-Ping-Limit.
+- **Reschedule-in-die-Vergangenheit-Fallback**: Wurde ein Match auf einen
+  **bereits vergangenen** Kickoff verschoben (Sep-2026: "BIG vs. G2" 09:00 →
+  08:20, vom Bot erst ~5 min nach dem neuen Kickoff gesehen), ist das normale
+  T-30-Fenster unmöglich. `_check_for_match_reminders` sendet den Thread + Ping
+  dann **sofort** nach — solange das Match noch plausibel live ist (nicht
+  `has_ended`, Start < 4 h her, end_time-Grace wie Health-Check). Ohne das bliebe
+  ein solches Match dauerhaft ohne Thread/Ping.
 - **Reschedule/Update**: `_edit_reminder_message` aktualisiert bei Time- oder
   Opponent-Änderung **sowohl** die Thread-Nachricht (`reminder_message_id`) **als
   auch** die Ping-Card (`ping_message_id`) und **benennt den Thread um**, falls

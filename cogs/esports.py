@@ -3040,20 +3040,38 @@ class EsportsCog(commands.Cog):
         now = datetime.now(timezone.utc)
         
         for match in self.matches.values():
-            if (not match.cancelled and
-                not match.reminder_message_id and  # No reminder sent yet
-                not match.forum_thread_id and      # No thread created yet
-                match.start_time > now):  # Match hasn't started yet
+            if (match.cancelled or
+                match.has_ended or              # Match is over
+                match.reminder_message_id or    # No reminder sent yet
+                match.forum_thread_id):         # No thread created yet
+                continue
 
+            time_to_start = (match.start_time - now).total_seconds()
+
+            if 0 < time_to_start <= 1800:
                 # Fire as close to exactly T-30 minutes as the 1-minute poll allows:
                 # the preferred moment is a 1-minute window just below the 30-minute
                 # mark. The window is open for the whole last 30 minutes though, so a
                 # match that enters the API late (or a restart during the window)
                 # still gets its reminder. The health check flags reminder_missing
                 # for exactly this same window (0 < time_to_start <= 1800) — already
-                # started matches are never re-reminded and must not be flagged.
-                time_to_start = (match.start_time - now).total_seconds()
-                if 0 < time_to_start <= 1800:  # last 30 minutes, up to kickoff
+                # started matches are never flagged there.
+                await self._send_match_reminder(match, channel)
+            elif match.start_time <= now:
+                # Fallback: the match was rescheduled to an earlier kickoff that
+                # has already passed — Sep-2026: "BIG vs. G2" was moved 09:00 ->
+                # 08:20 and only discovered ~5 min after the new kickoff, so the
+                # normal T-30 window was impossible and no thread was ever created.
+                # Send the thread + ping instantly so every match gets one. Only
+                # while the match is still plausibly live (not ended, started < 4 h
+                # ago — aligned with _check_for_reminder_cleanup's 4h assumption).
+                started_ago = now - match.start_time
+                end_grace = match.end_time is None or now < match.end_time + timedelta(hours=1)
+                if started_ago < timedelta(hours=4) and end_grace:
+                    self.log.info(
+                        f"Match {match.id} ({match.event_name}) already started without "
+                        f"a reminder (rescheduled to an earlier kickoff?) — sending instantly"
+                    )
                     await self._send_match_reminder(match, channel)
 
     async def _check_for_whatsapp_pings(self):
