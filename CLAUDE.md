@@ -167,6 +167,15 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   dann **sofort** nach — solange das Match noch plausibel live ist (nicht
   `has_ended`, Start < 4 h her, end_time-Grace wie Health-Check). Ohne das bliebe
   ein solches Match dauerhaft ohne Thread/Ping.
+- **Ende-Signal für den Reminder-Cleanup ist `has_ended`, nicht `end_time`**:
+  `_check_for_reminder_cleanup` löscht Reminder/Ping-Card nur bei `cancelled`,
+  `has_ended` oder 4 h nach Start (Safety-Net). Das API-`end_time`/`last_map_end`
+  ist nur eine grobe Schätzung, die **während eines laufenden Matches** bereits
+  vorbeisein kann — ohne diesen Fix hätte ein Live-Match (Sep-2026: "BIG vs.
+  G2", `last_map_end` 11:20Z, noch Map 3) seinen Reminder verloren und der
+  Reschedule-Fallback hätte jede Minute einen neuen Duplikat-Thread erzeugt.
+  Der 4-h-Cap des Fallbacks ist bewusst deckungsgleich mit dem Cleanup-Safety-Net,
+  damit es an der Grenze nie zu einem Ping-Pong kommt.
 - **Reschedule/Update**: `_edit_reminder_message` aktualisiert bei Time- oder
   Opponent-Änderung **sowohl** die Thread-Nachricht (`reminder_message_id`) **als
   auch** die Ping-Card (`ping_message_id`) und **benennt den Thread um**, falls
@@ -176,7 +185,10 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   Poll nach Restart alle existierenden Reminder/Ping-Cards/Thread-Titles auf den
   aktuellen API-Stand — fängt Änderungen, die während Downtime/Crash passiert sind.
 - Reminder + Ping-Card werden automatisch gelöscht, wenn der Match endet
-  (`_check_for_reminder_cleanup`).
+  (`_check_for_reminder_cleanup`). `_handle_match_finished` räumt den Reminder
+  auch dann auf, wenn das Discord-Event schon beendet war (z. B. Livescore/API-
+  Sync-Finish) — sonst bleiben verwaiste Ping-Einträge in den Maps zurück
+  (Sep-2026: "BIG vs. G2").
 
 **45-Min-WhatsApp-Ping:**
 - Kleine CV2-Karte im `PING_WHATSAPP`-Channel 45 min vor Kickoff

@@ -2160,52 +2160,56 @@ class EsportsCog(commands.Cog):
         try:
             if not match.discord_event_id:
                 self.log.debug(f"No Discord event to end for finished match {match.id}")
-                return
-            
-            # Find and end the event
-            if config.esports_guild_id:
-                # Use configured guild if specified
-                guild = self.bot.get_guild(config.esports_guild_id)
-                if guild:
-                    try:
-                        event = await guild.fetch_scheduled_event(match.discord_event_id)
-                        if event.status == discord.EventStatus.active:
-                            await event.end()
-                            self.log.info(f"Ended Discord event {match.discord_event_id} for finished match {match.id}: {match.event_name}")
-                        elif event.status == discord.EventStatus.scheduled:
-                            # If match finished before it was supposed to start, delete the event
-                            await event.delete()
-                            self.log.info(f"Deleted Discord event {match.discord_event_id} for finished match {match.id}: {match.event_name}")
-                    except discord.NotFound:
-                        self.log.debug(f"Event {match.discord_event_id} not found in configured guild")
-                    except Exception as e:
-                        self.log.error(f"Error ending event from configured guild: {e}")
             else:
-                # Search through all guilds (original behavior)
-                for guild in self.bot.guilds:
-                    try:
-                        event = await guild.fetch_scheduled_event(match.discord_event_id)
-                        if event.status == discord.EventStatus.active:
-                            await event.end()
-                            self.log.info(f"Ended Discord event {match.discord_event_id} for finished match {match.id}: {match.event_name}")
-                        elif event.status == discord.EventStatus.scheduled:
-                            # If match finished before it was supposed to start, delete the event
-                            await event.delete()
-                            self.log.info(f"Deleted Discord event {match.discord_event_id} for finished match {match.id}: {match.event_name}")
-                        break
-                        
-                    except discord.NotFound:
-                        continue
-                    except Exception as e:
-                        self.log.debug(f"Error ending event from guild {guild.id}: {e}")
-                        continue
-            
-            # Clean up mappings
-            if match.discord_event_id in self.event_to_match:
-                del self.event_to_match[match.discord_event_id]
-            match.discord_event_id = None
-            
-            # Clean up reminder message if it exists
+                # Find and end the event
+                if config.esports_guild_id:
+                    # Use configured guild if specified
+                    guild = self.bot.get_guild(config.esports_guild_id)
+                    if guild:
+                        try:
+                            event = await guild.fetch_scheduled_event(match.discord_event_id)
+                            if event.status == discord.EventStatus.active:
+                                await event.end()
+                                self.log.info(f"Ended Discord event {match.discord_event_id} for finished match {match.id}: {match.event_name}")
+                            elif event.status == discord.EventStatus.scheduled:
+                                # If match finished before it was supposed to start, delete the event
+                                await event.delete()
+                                self.log.info(f"Deleted Discord event {match.discord_event_id} for finished match {match.id}: {match.event_name}")
+                        except discord.NotFound:
+                            self.log.debug(f"Event {match.discord_event_id} not found in configured guild")
+                        except Exception as e:
+                            self.log.error(f"Error ending event from configured guild: {e}")
+                else:
+                    # Search through all guilds (original behavior)
+                    for guild in self.bot.guilds:
+                        try:
+                            event = await guild.fetch_scheduled_event(match.discord_event_id)
+                            if event.status == discord.EventStatus.active:
+                                await event.end()
+                                self.log.info(f"Ended Discord event {match.discord_event_id} for finished match {match.id}: {match.event_name}")
+                            elif event.status == discord.EventStatus.scheduled:
+                                # If match finished before it was supposed to start, delete the event
+                                await event.delete()
+                                self.log.info(f"Deleted Discord event {match.discord_event_id} for finished match {match.id}: {match.event_name}")
+                            break
+
+                        except discord.NotFound:
+                            continue
+                        except Exception as e:
+                            self.log.debug(f"Error ending event from guild {guild.id}: {e}")
+                            continue
+
+                # Clean up mappings
+                if match.discord_event_id in self.event_to_match:
+                    del self.event_to_match[match.discord_event_id]
+                match.discord_event_id = None
+
+            # Clean up reminder/thread/ping messages. This must run even when
+            # the Discord event was already ended (e.g. a tracker finished via
+            # the livescore loop / API-sync has_ended fallback), otherwise
+            # orphaned ping/plain-ping entries linger forever in the maps —
+            # Sep-2026: "BIG vs. G2" left stale ping rows after the pre-fix
+            # duplicate-thread loop removed the reminder but not the pings.
             await self._cleanup_match_reminder(match)
             
             # Clean up CS game tracking if active
@@ -3527,13 +3531,20 @@ class EsportsCog(commands.Cog):
                 reminders_to_delete.append(reminder_id)
                 continue
             
-            # Check if match has ended (including fallback for matches without end time)
+            # Check if match has ended. has_ended from the main poll is the
+            # authoritative signal — end_time (last_map_end) is only a coarse
+            # scheduling estimate that can pass while a match is still live
+            # (Sep-2026: "BIG vs. G2" was still on map 3 when its 11:20Z
+            # estimate passed, which deleted the reminder/ping and re-triggered
+            # the reschedule-fallback every poll, creating duplicate threads).
+            # The 4h-after-start rule stays as a safety net for matches that
+            # linger in the API without ever being flagged ended.
             match_ended = False
-            if match.end_time and match.end_time <= now:
+            if match.cancelled:
+                match_ended = True
+            elif match.has_ended:
                 match_ended = True
             elif (now - match.start_time).total_seconds() > 14400:  # 4 hours after start
-                match_ended = True
-            elif match.cancelled:
                 match_ended = True
             
             if match_ended:
