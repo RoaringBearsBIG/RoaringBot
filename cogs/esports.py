@@ -1605,7 +1605,8 @@ class EsportsCog(commands.Cog):
             old_match.start_time != new_match.start_time or
             old_match.team_a != new_match.team_a or
             old_match.team_b != new_match.team_b or
-            old_match.tournament_name != new_match.tournament_name
+            old_match.tournament_name != new_match.tournament_name or
+            old_match.block_voice_channel != new_match.block_voice_channel
         )
 
     EVENT_START_LEAD = timedelta(minutes=5)
@@ -1682,6 +1683,39 @@ class EsportsCog(commands.Cog):
             )
         except Exception as e:
             self.log.warning(f"Could not reconcile event {event.id} for match {match.id}: {e}")
+
+    async def _reconcile_event_voice_channel(self, event: discord.ScheduledEvent, match: "EsportsMatch"):
+        """Bring a still-scheduled voice event's channel in line with the API's
+        current ``block_voice_channel``. Runs every poll for scheduled events,
+        because a ``block_voice_channel`` change is otherwise only detected via
+        ``_match_needs_update``'s old_match diff — which can't fire on the first
+        poll after a restart (matches aren't persisted, so there's no old_match).
+        Without this, a manual VC switch made while the bot was down sticks
+        forever (Sep-2026: "BIG Academy vs. Reveal" stayed on VC 2 after a
+        manual VC 2→1 change). Discord only allows channel edits while the
+        event is still scheduled, which is exactly the case here.
+        """
+        desired_vc = None
+        if match.block_voice_channel == "VC 1" and config.esports_vc1_id:
+            desired_vc = event.guild.get_channel(config.esports_vc1_id)
+        elif match.block_voice_channel == "VC 2" and config.esports_vc2_id:
+            desired_vc = event.guild.get_channel(config.esports_vc2_id)
+
+        if (desired_vc is None
+                or event.entity_type != discord.EntityType.voice
+                or event.channel_id == desired_vc.id):
+            return
+
+        try:
+            await event.edit(channel=desired_vc)
+            self.log.info(
+                f"Reconciled event {event.id} voice channel for match {match.id} "
+                f"({match.event_name}): -> {match.block_voice_channel}"
+            )
+        except Exception as e:
+            self.log.warning(
+                f"Could not reconcile event {event.id} voice channel for match {match.id}: {e}"
+            )
 
     def _match_health_issues(self, match: "EsportsMatch", now: datetime) -> List[str]:
         """Detect and log discrepancies between what should exist for an
@@ -2025,6 +2059,29 @@ class EsportsCog(commands.Cog):
                 self.log.info(
                     f"Match {match.id} rescheduled to {match.start_time} while event {event.id} "
                     f"was already active — ending stale event and recreating"
+                )
+                try:
+                    await event.end()
+                except Exception as e:
+                    self.log.warning(f"Could not end stale event {event.id}: {e}")
+                if match.discord_event_id in self.event_to_match:
+                    del self.event_to_match[match.discord_event_id]
+                match.discord_event_id = None
+                await self._save_data()
+                await self._create_discord_event(match)
+                return
+
+            # A voice-channel reassignment can't be applied to an active voice
+            # event (Discord doesn't allow editing the channel after start).
+            # End the stale event and recreate it on the newly assigned VC.
+            if (not can_update_start_time and
+                    event.status == discord.EventStatus.active and
+                    entity_type == discord.EntityType.voice and
+                    voice_channel is not None and
+                    event.channel_id != voice_channel.id):
+                self.log.info(
+                    f"Match {match.id} voice channel changed to {match.block_voice_channel} "
+                    f"while event {event.id} was already active — ending stale event and recreating"
                 )
                 try:
                     await event.end()
@@ -2987,6 +3044,7 @@ class EsportsCog(commands.Cog):
             # times — e.g. legacy events whose start sat at the real kickoff
             # instead of kickoff − 5 min.
             elif event.status == discord.EventStatus.scheduled:
+                await self._reconcile_event_voice_channel(event, match)
                 await self._reconcile_event_schedule(event, match, now)
 
             # NOTE: events are deliberately NOT ended on a time estimate here.

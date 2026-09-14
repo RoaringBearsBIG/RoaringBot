@@ -59,6 +59,16 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   dauerhafter Health-Error-Spam). Start wird auf now+30s geclampt, der Event
   startet beim nächsten Poll automatisch.
 - Voice-Events wenn API `block_voice_channel` "VC 1"/"VC 2" + Env-Vars gesetzt.
+  Eine API-Änderung von `block_voice_channel` (z. B. manuell "VC 2" → "VC 1")
+  wird automatisch nachgezogen: `_match_needs_update` triggert dann
+  `_update_discord_event`. Bei einem noch geplanten Event wird der Channel
+  per `edit` gesetzt; bei einem bereits aktiven Voice-Event endet das alte
+  Event und wird auf dem neuen VC neu erstellt (Discord verbietet Channel-
+  Edits nach Start). Da Matches nicht persistiert werden, gibt es nach einem
+  Restart keinen `old_match`-Diff — `_reconcile_event_voice_channel` (läuft
+  jeden Poll für noch geplante Events) zieht den Channel trotzdem nach
+  (Sep-2026: "BIG Academy vs. Reveal" blieb nach manueller VC 2→1-Änderung
+  während Downtime sonst dauerhaft auf VC 2).
 - Event-Description: `[wannspieltbig](detail_url)` und `🔗 [HLTV](hltv_url)` (CS-only)
   in **einer Zeile** durch ` • ` getrennt — kein Zeilenumbruch zwischen den Links.
 - **Ende ausschließlich durch wannspieltbig-Signale**, nie durch Zeitschätzung:
