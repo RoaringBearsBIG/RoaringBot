@@ -116,13 +116,14 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
     "active_discord_events": 7,
     "scheduled_matches": 6,                  // Matches innerhalb der aktuellen Woche + laufend - das, was das Dashboard als "geplante Matches" zeigt
     "scheduled_discord_events": 6,           // davon mit tatsächlich existierendem Discord-Event
-    "active_cs_trackers": 0,
+    "active_cs_trackers": 0,                 // aktive Score-Tracker (CS/LoL/TM)
     "weekly_summary_last_updated": "2026-07-08T22:15:21Z",
     "weekly_summary_message_id": 1523448617246134449,
     "weekly_summary_last_error": null,
     "last_reminder_sent_at": "2026-07-08T18:00:02Z",
     "last_reminder_match": "BIG vs. TBA",
-    "cs_trackers": [                         // Snapshot aller aktiven CS-Score-Tracker
+    "cs_trackers": [                         // Snapshot aller aktiven Score-Tracker (CS/LoL/TM).
+                                             // CS: Round-Score + Maps; LoL/TM: nur Maps (binäres Map-Ergebnis, score "0-0").
       {
         "match_id": 2319,
         "teams": "BIG vs. TBA",

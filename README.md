@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Discord bot for the Roaring Bears e.V. Discord server</strong> — match tracking,
-  CS live-score overlays, birthday announcements, finance reports, and
+  live scores (CS/LoL/TM), birthday announcements, finance reports, and
   moderation. Built with discord.py and PostgreSQL, deployed via Docker.
 </p>
 <p align="center">
@@ -36,7 +36,7 @@
 
 | Cog | Description | |
 |---|---|---|
-| **Esports** | Match tracking powered by [wannspieltbig.de](https://github.com/ckarrie/ckw-csgo) by [ckarrie](https://github.com/ckarrie) — Discord scheduled events, CS live-score CV2 overlays, 30-min reminders with versus images, weekly summaries |
+| **Esports** | Match tracking powered by [wannspieltbig.de](https://github.com/ckarrie/ckw-csgo) by [ckarrie](https://github.com/ckarrie) — Discord scheduled events, live scores (CS score overlay + LoL/TM in the event name), summary-channel 30-min reminders with versus images, `/pingpreview`, weekly summaries |
 | **Birthday** | Daily birthday posts at 10:00 Europe/Berlin with age tracking, sourced from Google Sheets |
 | **Moderation** | Member join/leave logging via webhook, auto-join role, honeypot and bot-trap protection, `/clear` bulk-delete |
 | **Feedback** | `/feedback` slash command with CV2 modal (subject, anonymity toggle), REST API consumed by the dashboard |
@@ -56,7 +56,7 @@
 
 ```
 cogs/                 Discord cogs (one file per feature)
-  esports.py          Match tracking, reminders, CS live-score, weekly summary
+  esports.py          Match tracking, reminders, live scores (CS/LoL/TM), weekly summary
   birthday.py         Daily birthday announcements
   moderation.py       Member logging, honeypot, bot-trap, /clear
   feedback.py         /feedback slash command + CV2 modal
