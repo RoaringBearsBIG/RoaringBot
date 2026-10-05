@@ -143,7 +143,7 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
         "is_live": true,
         "has_discord_event": true,
         "reminder_at": "2026-07-09T17:30:00Z",   // Kickoff - 30min
-        "reminder_ok": false,                     // true sobald reminder_message_id/forum_thread_id gesetzt ist
+        "reminder_ok": false,                     // true sobald reminder_message_id (Summary-Channel-Karte) gesetzt ist
         "tracking_at": null,                      // Kickoff - 5min, nur bei game == "cs", sonst null
         "tracking_ok": null,                      // null wenn nicht CS
         "voice_event_at": "2026-07-09T17:55:00Z", // Kickoff - 5min (geclamped auf jetzt+30s)

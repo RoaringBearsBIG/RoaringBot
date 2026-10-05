@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import pytz
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 from core.config import config
@@ -94,9 +95,7 @@ class EsportsMatch:
         self.hltv_match_id = match_data.get("hltv_match_id")
         self.discord_event_id: Optional[int] = None
         self.reminder_message_id: Optional[int] = None
-        self.forum_thread_id: Optional[int] = None
-        self.ping_message_id: Optional[int] = None  # Summary-channel ping message (CS large-role workaround)
-        self.ping_text_message_id: Optional[int] = None  # Plain-text role ping preceding the CV2 ping card
+        self.ping_text_message_id: Optional[int] = None  # Plain-text role ping that follows the reminder card
     
     @property
     def event_name(self) -> str:
@@ -264,9 +263,13 @@ class CSGameTracker:
         return None
     
     def get_event_score_name(self) -> str:
-        """Generate Discord event name with live score, e.g. 'BIG vs MIBR - 3:4 (1:0)'"""
-        score = "bra71l" if (self.team_a_score, self.team_b_score) == (7, 1) else f"{self.team_a_score}:{self.team_b_score}"
-        return f"{self.match.team_a} vs {self.match.team_b} - {score} ({self.team_a_maps}:{self.team_b_maps})"
+        """Discord event name with the live score. CS shows the current map's
+        round score plus maps won ('BIG vs MIBR - 3:4 (1:0)'); LoL/TM only carry
+        a binary map result in the API, so they show maps won ('BIG vs X - 1:0')."""
+        if self.match.game == "cs":
+            score = "bra71l" if (self.team_a_score, self.team_b_score) == (7, 1) else f"{self.team_a_score}:{self.team_b_score}"
+            return f"{self.match.team_a} vs {self.match.team_b} - {score} ({self.team_a_maps}:{self.team_b_maps})"
+        return f"{self.match.team_a} vs {self.match.team_b} - {self.team_a_maps}:{self.team_b_maps}"
 
 CS_EMOTE = "<:cs:1416235161594499092>"
 GAME_EMOJI = {"cs": CS_EMOTE, "lol": "<:lol:1416235138307854416>", "tm": "🏎️"}
@@ -361,43 +364,6 @@ def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention:
             url=f"https://discord.com/events/{guild_id}/{match.discord_event_id}",
         ))
     row.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="wannspieltbig", url=match.detail_url))
-    container.add_item(row)
-
-    view = discord.ui.LayoutView(timeout=None)
-    view.add_item(container)
-    return view
-
-
-def build_cs_ping_view(match: "EsportsMatch", thread_id: int, guild_id: int,
-                       versus: bool = False) -> discord.ui.LayoutView:
-    """CV2 summary-channel ping message: same layout as the thread reminder
-    but with a single "Match Thread" link button instead of Voice+wannspieltbig.
-    The role ping goes in message.content, not inside the CV2 container."""
-    unix_ts = int(match.start_time.timestamp())
-    game_emoji = GAME_EMOJI.get(match.game, "🎮")
-
-    container = discord.ui.Container(accent_colour=discord.Colour(0xFF6B35))
-
-    gallery = discord.ui.MediaGallery()
-    if versus:
-        gallery.add_item(media="attachment://versus.jpg")
-    else:
-        gallery.add_item(media="attachment://big.png")
-        if match.team_b_logo_url:
-            gallery.add_item(media=match.team_b_logo_url)
-    container.add_item(gallery)
-
-    container.add_item(discord.ui.TextDisplay(
-        f"## {match.team_a} vs {match.team_b} — <t:{unix_ts}:R>\n"
-        f"-# {game_emoji} {match.tournament_name} · Best of {match.bestof} · <t:{unix_ts}:t> Uhr"
-    ))
-
-    row = discord.ui.ActionRow()
-    row.add_item(discord.ui.Button(
-        style=discord.ButtonStyle.link,
-        label="Match Thread",
-        url=f"https://discord.com/channels/{guild_id}/{thread_id}",
-    ))
     container.add_item(row)
 
     view = discord.ui.LayoutView(timeout=None)
@@ -768,8 +734,6 @@ class EsportsCog(commands.Cog):
         self.known_match_ids: Set[int] = set()  # Persisted across restarts to prevent duplicate events
         self.event_to_match: Dict[int, int] = {}  # Discord event ID -> match ID
         self.reminder_to_match: Dict[int, int] = {}  # Reminder message ID -> match ID
-        self.thread_to_match: Dict[int, int] = {}  # Forum thread ID -> match ID
-        self.ping_to_match: Dict[int, int] = {}  # Ping message ID -> match ID (CS large-role workaround)
         self.plain_ping_to_match: Dict[int, int] = {}  # Plain-text role ping message ID -> match ID
         self.event_start_failures: Dict[int, int] = {}  # event ID -> consecutive failure count
         self._first_poll_done: bool = False  # set after first successful poll post-startup
@@ -806,8 +770,6 @@ class EsportsCog(commands.Cog):
 
             self.event_to_match = data["event_to_match"]
             self.reminder_to_match = data["reminder_to_match"]
-            self.thread_to_match = data["thread_to_match"]
-            self.ping_to_match = data.get("ping_to_match", {})
             self.plain_ping_to_match = data.get("plain_ping_to_match", {})
             self.summary_message_id = data["summary_message_id"]
             self.monitored_matches = set(data["monitored_matches"])
@@ -844,14 +806,14 @@ class EsportsCog(commands.Cog):
                     "match_maps": tracker.match_maps,
                 }
                 for match_id, tracker in self.active_cs_games.items()
-                if not tracker.is_finished and tracker.message_id
+                if not tracker.is_finished
             }
 
             await self.bot.db.esports.save_all(
                 event_to_match=self.event_to_match,
                 reminder_to_match=self.reminder_to_match,
-                thread_to_match=self.thread_to_match,
-                ping_to_match=self.ping_to_match,
+                thread_to_match={},
+                ping_to_match={},
                 plain_ping_to_match=self.plain_ping_to_match,
                 summary_message_id=self.summary_message_id,
                 monitored_matches=self.monitored_matches,
@@ -1041,18 +1003,6 @@ class EsportsCog(commands.Cog):
                 for reminder_id, stored_match_id in self.reminder_to_match.items():
                     if stored_match_id == match.id:
                         match.reminder_message_id = reminder_id
-                        break
-
-                # Restore forum thread ID from stored mappings
-                for thread_id, stored_match_id in self.thread_to_match.items():
-                    if stored_match_id == match.id:
-                        match.forum_thread_id = thread_id
-                        break
-
-                # Restore ping message ID from stored mappings
-                for ping_id, stored_match_id in self.ping_to_match.items():
-                    if stored_match_id == match.id:
-                        match.ping_message_id = ping_id
                         break
 
                 # Restore plain-text role ping ID from stored mappings
@@ -1248,11 +1198,11 @@ class EsportsCog(commands.Cog):
 
                     should_finish = (current.has_ended and not tracker.is_finished
                                      and now >= current.start_time + timedelta(minutes=15))
-                    if (scores_changed or should_finish) and tracker.message_id:
+                    if scores_changed or should_finish:
                         await self._update_event_name_with_score(tracker)
                         if should_finish:
                             await self._finish_cs_tracker(match_id, tracker, "main-poll has_ended (not in livescore feed)")
-                        else:
+                        elif tracker.message_id:
                             try:
                                 channel = self.bot.get_channel(config.esports_update_channel_id)
                                 if channel:
@@ -1343,8 +1293,9 @@ class EsportsCog(commands.Cog):
                 )
                 match_finished = map_score_finished or (has_ended and maps_played) or main_poll_ended
 
-                # Update Discord message and event name if scores changed or match finished
-                if (scores_changed or match_finished) and tracker.message_id:
+                # Update event name (all games) and score message (CS only) if
+                # scores changed or the match finished.
+                if scores_changed or match_finished:
                     await self._update_event_name_with_score(tracker)
                     if match_finished and not tracker.is_finished:
                         # Winner rendering, no buttons (is_finished=True);
@@ -1356,7 +1307,7 @@ class EsportsCog(commands.Cog):
                             match_id, tracker,
                             "API sync" if map_score_finished or (has_ended and maps_played) else "main-poll has_ended",
                         )
-                    else:
+                    elif tracker.message_id:
                         try:
                             channel = self.bot.get_channel(config.esports_update_channel_id)
                             if channel:
@@ -1577,7 +1528,7 @@ class EsportsCog(commands.Cog):
                 elif not match.cancelled and self._match_needs_update(old_match, match):
                     # Match details changed (time, opponent, tournament, etc.)
                     if match.reminder_message_id:
-                        # Edit the existing reminder/ping messages and thread title
+                        # Edit the existing summary-channel reminder
                         await self._edit_reminder_message(match)
                     # else: no reminder sent yet, will fire normally at 30-min mark
                     await self._update_discord_event(match)
@@ -1733,7 +1684,7 @@ class EsportsCog(commands.Cog):
             issues.append("no_discord_event")
 
         time_to_start = (match.start_time - now).total_seconds()
-        reminder_ok = bool(match.reminder_message_id or match.forum_thread_id)
+        reminder_ok = bool(match.reminder_message_id)
         # Only flag while the match is still upcoming (0..30 min before kickoff),
         # matching the sender's window in _check_for_match_reminders. Without the
         # lower bound, matches that already started but linger in the API would be
@@ -1770,7 +1721,7 @@ class EsportsCog(commands.Cog):
             issues = self._match_health_issues(m, now)
 
             reminder_at = m.start_time - timedelta(minutes=30)
-            reminder_ok = bool(m.reminder_message_id or m.forum_thread_id)
+            reminder_ok = bool(m.reminder_message_id)
 
             voice_event_at = self._event_target_start(m)
             event_status = self._event_status_by_match.get(m.id)
@@ -2645,14 +2596,17 @@ class EsportsCog(commands.Cog):
         return any(r.id == SCORE_UPDATE_ROLE_ID for r in getattr(user, "roles", []))
 
     async def _check_for_starting_matches(self):
-        """Check if any CS matches are starting soon and create score trackers"""
+        """Check if any tracked-game matches are starting soon and create score
+        trackers. CS/LoL/TM all expose per-map scores, so all three get a
+        tracker — CS also gets the CV2 score message, LoL/TM only feed the
+        live score into the Discord event name (voice-channel status)."""
         if not config.esports_update_channel_id:
             return
             
         now = datetime.now(timezone.utc)
         
         for match in self.matches.values():
-            if (match.game == "cs" and 
+            if (match.game in ("cs", "lol", "tm") and
                 not match.cancelled and 
                 match.id not in self.active_cs_games and
                 match.id not in self.monitored_matches):
@@ -2794,7 +2748,7 @@ class EsportsCog(commands.Cog):
         )
 
     async def _reconcile_all_reminders(self, current_matches: dict):
-        """After a restart, bring all existing reminders/pings/threads in sync
+        """After a restart, bring all existing summary-channel reminders in sync
         with current match data.  Without this, changes that happened while the
         bot was down are never detected because the normal update path needs an
         old_match to compare against (which doesn't exist on the first poll)."""
@@ -3058,7 +3012,9 @@ class EsportsCog(commands.Cog):
             # trade-off vs. cutting a live match's event short.
 
     async def _start_cs_game_tracking(self, match: EsportsMatch):
-        """Start tracking a CS game"""
+        """Start tracking a match's live score. CS gets the CV2 score message
+        (with scorekeeper buttons); LoL/TM are tracked only so their live map
+        score lands in the Discord event name (voice-channel status)."""
         try:
             # Create tracker
             tracker = CSGameTracker(match)
@@ -3067,23 +3023,24 @@ class EsportsCog(commands.Cog):
             tracker.match_maps = await self._fetch_match_maps(match.id)
             
             if not tracker.match_maps:
-                self.log.warning(f"No map data available for CS match {match.id}")
+                self.log.warning(f"No map data available for match {match.id}")
                 return
-            
-            # Get update channel
-            channel = self.bot.get_channel(config.esports_update_channel_id)
-            if not channel:
-                self.log.error(f"Update channel {config.esports_update_channel_id} not found")
-                return
-            
-            # Send the CV2 score message (layout view carries the whole content)
-            message = await channel.send(view=ScoreUpdateView(tracker, self))
-            tracker.message_id = message.id
+
+            if match.game == "cs":
+                # Get update channel
+                channel = self.bot.get_channel(config.esports_update_channel_id)
+                if not channel:
+                    self.log.error(f"Update channel {config.esports_update_channel_id} not found")
+                    return
+                # Send the CV2 score message (layout view carries the whole content)
+                message = await channel.send(view=ScoreUpdateView(tracker, self))
+                tracker.message_id = message.id
+            # else: no score message for LoL/TM — event name only
             
             # Store tracker
             self.active_cs_games[match.id] = tracker
             
-            self.log.info(f"Started CS game tracking for match {match.id}: {match.event_name}")
+            self.log.info(f"Started {match.game.upper()} game tracking for match {match.id}: {match.event_name}")
             
         except Exception as e:
             self.log.error(f"Error starting CS game tracking for match {match.id}: {e}")
@@ -3104,8 +3061,7 @@ class EsportsCog(commands.Cog):
         for match in self.matches.values():
             if (match.cancelled or
                 match.has_ended or              # Match is over
-                match.reminder_message_id or    # No reminder sent yet
-                match.forum_thread_id):         # No thread created yet
+                match.reminder_message_id):     # No reminder sent yet
                 continue
 
             time_to_start = (match.start_time - now).total_seconds()
@@ -3123,8 +3079,8 @@ class EsportsCog(commands.Cog):
                 # Fallback: the match was rescheduled to an earlier kickoff that
                 # has already passed — Sep-2026: "BIG vs. G2" was moved 09:00 ->
                 # 08:20 and only discovered ~5 min after the new kickoff, so the
-                # normal T-30 window was impossible and no thread was ever created.
-                # Send the thread + ping instantly so every match gets one. Only
+                # normal T-30 window was impossible and no reminder was ever sent.
+                # Send the reminder + ping instantly so every match gets one. Only
                 # while the match is still plausibly live (not ended, started < 4 h
                 # ago — aligned with _check_for_reminder_cleanup's 4h assumption).
                 started_ago = now - match.start_time
@@ -3303,91 +3259,43 @@ class EsportsCog(commands.Cog):
             self.log.warning(f"Could not build event cover image for match {match.id}: {e}")
             return None
 
-    async def _send_delayed_ping(self, thread: discord.Thread, mention_text: str, match_id: int,
-                                  summary_channel: Optional[discord.TextChannel] = None,
-                                  versus_bytes: Optional[bytes] = None):
-        """Users reported missing notifications when the role ping followed the
-        reminder message immediately — give Discord a moment to settle the new
-        thread before pinging.
-
-        When *summary_channel* is provided a CV2 message (same design as the
-        thread reminder but with a single "Match Thread" button) is sent there,
-        with the role ping in ``content`` so recipients get notified.  This
-        bypasses Discord's 250-member thread role-ping limit."""
+    async def _send_delayed_ping(self, match: EsportsMatch, mention_text: str,
+                                 channel: discord.TextChannel):
+        """Post the game-role ping as a separate plain-text message in the
+        summary channel shortly after the reminder card. CV2 messages cannot
+        carry ``content``, so a plain message is needed to trigger the role
+        notification. The delay gives Discord a moment to settle the reminder
+        before pinging (users reported missing notifications otherwise)."""
         try:
             await asyncio.sleep(self.REMINDER_PING_DELAY)
-            match = self.matches.get(match_id)
-            if summary_channel and match:
-                # CS workaround: CV2 card + plain ping in summary channel
-                # (bypasses Discord's 250-member thread role-ping limit).
-                # CV2 messages cannot carry `content`, so the role ping is a
-                # separate plain-text message that triggers notifications.
-                guild_id = thread.guild.id
-                versus = versus_bytes is not None
-
-                # 1) Plain-text role ping — triggers push notifications
-                plain_ping_msg = await summary_channel.send(
-                    content=mention_text,
-                    allowed_mentions=discord.AllowedMentions(roles=True),
-                )
-                match.ping_text_message_id = plain_ping_msg.id
-                self.plain_ping_to_match[plain_ping_msg.id] = match_id
-
-                # 2) CV2 card — same design as the thread reminder but with
-                #    a single "Match Thread" link button
-                view = build_cs_ping_view(match, thread.id, guild_id, versus=versus)
-
-                if versus:
-                    file = discord.File(io.BytesIO(versus_bytes), filename="versus.jpg")
-                else:
-                    file = discord.File("resources/big.png", filename="big.png")
-
-                msg = await summary_channel.send(view=view, file=file)
-                match.ping_message_id = msg.id
-                self.ping_to_match[msg.id] = match_id
-                await self._save_data()
-            else:
-                # Original behavior: ping in thread (works for ≤250 member roles)
-                await thread.send(
-                    content=mention_text,
-                    allowed_mentions=discord.AllowedMentions(roles=True),
-                )
+            msg = await channel.send(
+                content=mention_text,
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+            match.ping_text_message_id = msg.id
+            self.plain_ping_to_match[msg.id] = match.id
+            await self._save_data()
         except Exception as e:
-            self.log.error(f"Failed to send delayed reminder ping for match {match_id}: {e}")
+            self.log.error(f"Failed to send delayed reminder ping for match {match.id}: {e}")
 
     async def _edit_reminder_message(self, match: EsportsMatch):
-        """Edit existing reminder/ping messages and thread title after a match update
+        """Edit the summary-channel reminder after a match update
         (reschedule, opponent change, tournament change, etc.)"""
         try:
             guild_id = config.esports_guild_id or (self.bot.guilds[0].id if self.bot.guilds else None)
             versus_bytes = await self._build_reminder_media(match)
             view = build_reminder_view(match, guild_id, versus=versus_bytes is not None)
 
-            message = None
-            thread = None
-
-            # Try forum thread first — also grab the thread for title renaming
-            if match.forum_thread_id:
-                thread = self.bot.get_channel(match.forum_thread_id)
-                if thread is None:
-                    try:
-                        thread = await self.bot.fetch_channel(match.forum_thread_id)
-                    except (discord.NotFound, discord.Forbidden):
-                        thread = None
-                if thread and isinstance(thread, discord.Thread):
-                    try:
-                        message = await thread.fetch_message(match.reminder_message_id)
-                    except discord.NotFound:
-                        pass
-
-            # Fallback: summary channel
-            if message is None and config.esports_summary_channel_id:
+            channel = None
+            if config.esports_summary_channel_id:
                 channel = self.bot.get_channel(config.esports_summary_channel_id)
-                if channel:
-                    try:
-                        message = await channel.fetch_message(match.reminder_message_id)
-                    except discord.NotFound:
-                        pass
+
+            message = None
+            if channel:
+                try:
+                    message = await channel.fetch_message(match.reminder_message_id)
+                except discord.NotFound:
+                    pass
 
             if message:
                 if versus_bytes is not None:
@@ -3396,54 +3304,6 @@ class EsportsCog(commands.Cog):
                     attachment = discord.File("resources/big.png", filename="big.png")
                 await message.edit(view=view, attachments=[attachment])
                 self.log.info(f"Edited reminder for updated match {match.id}: {match.event_name}")
-
-                # Also edit the ping card in the summary channel (CS workaround).
-                # Must create a fresh discord.File — the BytesIO underlying the
-                # first attachment was consumed by message.edit() above.
-                if match.ping_message_id and config.esports_summary_channel_id:
-                    ping_channel = self.bot.get_channel(config.esports_summary_channel_id)
-                    if ping_channel and thread:
-                        try:
-                            ping_msg = await ping_channel.fetch_message(match.ping_message_id)
-                            ping_view = build_cs_ping_view(
-                                match, thread.id, guild_id, versus=versus_bytes is not None
-                            )
-                            if versus_bytes is not None:
-                                ping_attachment = discord.File(
-                                    io.BytesIO(versus_bytes), filename="versus.jpg"
-                                )
-                            else:
-                                ping_attachment = discord.File(
-                                    "resources/big.png", filename="big.png"
-                                )
-                            await ping_msg.edit(view=ping_view, attachments=[ping_attachment])
-                            self.log.info(
-                                f"Edited ping card for updated match {match.id}: {match.event_name}"
-                            )
-                        except discord.NotFound:
-                            self.log.debug(
-                                f"Ping card {match.ping_message_id} for match {match.id} "
-                                f"not found — will be replaced on next ping"
-                            )
-                            match.ping_message_id = None
-
-                # Rename the forum thread if team names changed
-                if thread and isinstance(thread, discord.Thread):
-                    game_name = {"cs": "CS", "tm": "TM", "lol": "LoL"}.get(
-                        match.game, match.game.upper()
-                    )
-                    expected_title = f"{match.team_a} vs {match.team_b} – {game_name}"
-                    if thread.name != expected_title:
-                        try:
-                            await thread.edit(name=expected_title)
-                            self.log.info(
-                                f"Renamed thread {thread.id} to \"{expected_title}\" "
-                                f"for updated match {match.id}"
-                            )
-                        except Exception as rename_exc:
-                            self.log.warning(
-                                f"Could not rename thread {thread.id} for match {match.id}: {rename_exc}"
-                            )
             else:
                 # Message no longer exists — clear tracking so a fresh reminder fires at 30-min mark
                 self.reminder_to_match = {k: v for k, v in self.reminder_to_match.items() if v != match.id}
@@ -3454,111 +3314,32 @@ class EsportsCog(commands.Cog):
             self.log.error(f"Error editing reminder for match {match.id}: {e}")
 
     async def _send_match_reminder(self, match: EsportsMatch, channel: discord.TextChannel):
-        """Send 30-minute reminder for a match"""
+        """Send the 30-minute reminder as a CV2 card to the summary channel,
+        followed by a separate plain-text game-role ping (CV2 can't carry
+        content). No per-match thread is created anymore."""
         try:
-            # Get the appropriate ping role based on game
-            ping_role_id = None
-            if match.game == "cs":
-                ping_role_id = config.ping_cs_role_id
-            elif match.game == "lol":
-                ping_role_id = config.ping_lol_role_id
-            elif match.game == "tm":
-                ping_role_id = config.ping_tm_role_id
-            
-            # Create mention string
-            mention_text = ""
-            if ping_role_id:
-                mention_text = f"<@&{ping_role_id}>"
+            ping_role_id = {
+                "cs": config.ping_cs_role_id,
+                "lol": config.ping_lol_role_id,
+                "tm": config.ping_tm_role_id,
+            }.get(match.game)
+            mention_text = f"<@&{ping_role_id}>" if ping_role_id else ""
 
             guild_id = channel.guild.id if channel.guild else config.esports_guild_id
             versus_bytes = await self._build_reminder_media(match)
             versus = versus_bytes is not None
             view = build_reminder_view(match, guild_id, versus=versus)
 
-            def reminder_file() -> discord.File:
-                # discord.File objects are single-use — build a fresh one per send
-                if versus:
-                    return discord.File(io.BytesIO(versus_bytes), filename="versus.jpg")
-                return discord.File("resources/big.png", filename="big.png")
+            if versus:
+                file = discord.File(io.BytesIO(versus_bytes), filename="versus.jpg")
+            else:
+                file = discord.File("resources/big.png", filename="big.png")
 
-            # CS matches with large ping roles (>250 members) need the ping in the
-            # summary channel instead of the thread — Discord caps thread role pings.
-            cs_channel = None
-            if match.game == "cs" and config.esports_summary_channel_id:
-                cs_channel = self.bot.get_channel(config.esports_summary_channel_id)
-
-            # Create/reuse forum thread if configured — ping goes into the thread
-            if config.esports_forum_channel_id:
-                forum_channel = self.bot.get_channel(config.esports_forum_channel_id)
-                if isinstance(forum_channel, discord.ForumChannel):
-                    try:
-                        # Reuse existing thread if match was rescheduled
-                        if match.forum_thread_id:
-                            existing = self.bot.get_channel(match.forum_thread_id)
-                            if existing is None:
-                                try:
-                                    existing = await self.bot.fetch_channel(match.forum_thread_id)
-                                except (discord.NotFound, discord.Forbidden):
-                                    existing = None
-                            if existing and isinstance(existing, discord.Thread):
-                                if existing.archived:
-                                    await existing.edit(archived=False)
-                                msg = await existing.send(view=view, file=reminder_file())
-                                if mention_text:
-                                    asyncio.create_task(self._send_delayed_ping(
-                                        existing, mention_text, match.id,
-                                        summary_channel=cs_channel,
-                                        versus_bytes=versus_bytes,
-                                    ))
-                                match.reminder_message_id = msg.id
-                                self.reminder_to_match[msg.id] = match.id
-                                await self._save_data()
-                                self.log.info(f"Sent rescheduled reminder in existing thread for match {match.id}: {match.event_name}")
-                                return
-                            else:
-                                # Thread no longer accessible — clear stale tracking so a fresh thread can be created
-                                self.log.warning(f"Existing thread {match.forum_thread_id} for match {match.id} not found, clearing stale tracking")
-                                self._close_forum_thread(match.forum_thread_id, match.id)
-
-                        # No existing thread — create a new one
-                        game_name = {"cs": "CS", "tm": "TM", "lol": "LoL"}.get(match.game, match.game.upper())
-                        thread_with_msg = await forum_channel.create_thread(
-                            name=f"{match.team_a} vs {match.team_b} – {game_name}",
-                            view=view,
-                            file=reminder_file(),
-                        )
-                        forum_thread = thread_with_msg.thread
-                        match.forum_thread_id = forum_thread.id
-                        self.thread_to_match[forum_thread.id] = match.id
-                        match.reminder_message_id = thread_with_msg.message.id
-                        self.reminder_to_match[thread_with_msg.message.id] = match.id
-                        # Send ping as separate, delayed message so Discord triggers proper notifications
-                        if mention_text:
-                            asyncio.create_task(self._send_delayed_ping(
-                                forum_thread, mention_text, match.id,
-                                summary_channel=cs_channel,
-                                versus_bytes=versus_bytes,
-                            ))
-                        await self._save_data()
-                        self.log.info(f"Sent 30-minute reminder (thread) for match {match.id}: {match.event_name}")
-                        status_reporter.record(
-                            "esports",
-                            last_reminder_sent_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            last_reminder_match=match.event_name,
-                        )
-                        return
-                    except Exception as e:
-                        self.log.error(f"Error creating/reusing forum thread for match {match.id}: {e}")
-
-            # Fallback: post to games channel if no forum channel configured.
-            # CV2 messages cannot carry `content`, so the role ping moves into
-            # the container as a small text line.
-            view = build_reminder_view(match, guild_id, mention=mention_text or None, versus=versus)
-            message = await channel.send(view=view, file=reminder_file())
+            message = await channel.send(view=view, file=file)
             match.reminder_message_id = message.id
             self.reminder_to_match[message.id] = match.id
             await self._save_data()
-            
+
             self.log.info(f"Sent 30-minute reminder for match {match.id}: {match.event_name}")
             status_reporter.record(
                 "esports",
@@ -3566,78 +3347,62 @@ class EsportsCog(commands.Cog):
                 last_reminder_match=match.event_name,
             )
 
+            if mention_text:
+                asyncio.create_task(self._send_delayed_ping(match, mention_text, channel))
+
         except Exception as e:
             self.log.error(f"Error sending reminder for match {match.id}: {e}")
             status_reporter.bump_counter("esports", "reminder_errors")
     
     async def _check_for_reminder_cleanup(self):
-        """Check for reminders that should be deleted after match ends"""
+        """Delete reminders (card + role ping) once the match has ended."""
         if not config.esports_summary_channel_id:
             return
-            
+
         channel = self.bot.get_channel(config.esports_summary_channel_id)
         if not channel:
             return
-            
+
         now = datetime.now(timezone.utc)
         reminders_to_delete = []
-        
+
         for reminder_id, match_id in self.reminder_to_match.items():
             match = self.matches.get(match_id)
             if not match:
                 # Match no longer exists, clean up reminder
                 reminders_to_delete.append(reminder_id)
                 continue
-            
+
             # Check if match has ended. has_ended from the main poll is the
             # authoritative signal — end_time (last_map_end) is only a coarse
             # scheduling estimate that can pass while a match is still live
             # (Sep-2026: "BIG vs. G2" was still on map 3 when its 11:20Z
-            # estimate passed, which deleted the reminder/ping and re-triggered
-            # the reschedule-fallback every poll, creating duplicate threads).
+            # estimate passed, which deleted the reminder and re-triggered the
+            # reschedule-fallback every poll, creating duplicate messages).
             # The 4h-after-start rule stays as a safety net for matches that
             # linger in the API without ever being flagged ended.
-            match_ended = False
-            if match.cancelled:
-                match_ended = True
-            elif match.has_ended:
-                match_ended = True
-            elif (now - match.start_time).total_seconds() > 14400:  # 4 hours after start
-                match_ended = True
-            
+            match_ended = (
+                match.cancelled
+                or match.has_ended
+                or (now - match.start_time).total_seconds() > 14400  # 4 hours after start
+            )
+
             if match_ended:
                 reminders_to_delete.append(reminder_id)
-        
+
         # Delete reminder messages
         for reminder_id in reminders_to_delete:
             match_id = self.reminder_to_match.get(reminder_id)
             match = self.matches.get(match_id) if match_id else None
 
-            if match and match.forum_thread_id:
-                # Close forum thread tracking (thread stays in Discord, archived by inactivity)
-                self._close_forum_thread(match.forum_thread_id, match_id)
-            elif not match:
-                # Match no longer exists — also clean up stale thread_to_match entries for this match_id
-                stale_thread_ids = [tid for tid, mid in self.thread_to_match.items() if mid == match_id]
-                for tid in stale_thread_ids:
-                    del self.thread_to_match[tid]
-                # Also clean up stale ping entries for this match_id
-                stale_ping_ids = [pid for pid, mid in self.ping_to_match.items() if mid == match_id]
-                for pid in stale_ping_ids:
-                    del self.ping_to_match[pid]
-                stale_plain_ping_ids = [pid for pid, mid in self.plain_ping_to_match.items() if mid == match_id]
-                for pid in stale_plain_ping_ids:
-                    del self.plain_ping_to_match[pid]
-            else:
-                # No thread — delete the channel message
-                try:
-                    message = await channel.fetch_message(reminder_id)
-                    await message.delete()
-                    self.log.info(f"Deleted reminder message {reminder_id}")
-                except discord.NotFound:
-                    self.log.debug(f"Reminder message {reminder_id} already deleted")
-                except Exception as e:
-                    self.log.warning(f"Failed to delete reminder message {reminder_id}: {e}")
+            try:
+                message = await channel.fetch_message(reminder_id)
+                await message.delete()
+                self.log.info(f"Deleted reminder message {reminder_id}")
+            except discord.NotFound:
+                self.log.debug(f"Reminder message {reminder_id} already deleted")
+            except Exception as e:
+                self.log.warning(f"Failed to delete reminder message {reminder_id}: {e}")
 
             # Clean up mappings
             if match:
@@ -3646,21 +3411,7 @@ class EsportsCog(commands.Cog):
             if match_id:
                 self._versus_cache.pop(match_id, None)
 
-            # Delete the summary-channel ping message (CS large-role workaround)
-            if match and match.ping_message_id:
-                try:
-                    ping_msg = await channel.fetch_message(match.ping_message_id)
-                    await ping_msg.delete()
-                    self.log.info(f"Deleted ping message {match.ping_message_id}")
-                except discord.NotFound:
-                    self.log.debug(f"Ping message {match.ping_message_id} already deleted")
-                except Exception as e:
-                    self.log.warning(f"Failed to delete ping message {match.ping_message_id}: {e}")
-                if match.ping_message_id in self.ping_to_match:
-                    del self.ping_to_match[match.ping_message_id]
-                match.ping_message_id = None
-
-            # Delete the plain-text role ping sent right before the ping card
+            # Delete the plain-text role ping
             if match and match.ping_text_message_id:
                 try:
                     plain_ping_msg = await channel.fetch_message(match.ping_text_message_id)
@@ -3674,24 +3425,19 @@ class EsportsCog(commands.Cog):
                     del self.plain_ping_to_match[match.ping_text_message_id]
                 match.ping_text_message_id = None
 
+            if not match and match_id:
+                # Match no longer exists — clean up stale plain-ping entries
+                stale_plain_ping_ids = [pid for pid, mid in self.plain_ping_to_match.items() if mid == match_id]
+                for pid in stale_plain_ping_ids:
+                    del self.plain_ping_to_match[pid]
+
         if reminders_to_delete:
             await self._save_data()
-    
-    def _close_forum_thread(self, thread_id: int, match_id: int):
-        """Clean up forum thread tracking data (Discord handles archiving via inactivity setting)"""
-        if thread_id in self.thread_to_match:
-            del self.thread_to_match[thread_id]
-        if match_id in self.matches:
-            self.matches[match_id].forum_thread_id = None
 
     async def _cleanup_match_reminder(self, match: EsportsMatch):
-        """Clean up reminder message for a specific match"""
+        """Delete the reminder card and role ping for a specific match"""
         if match.reminder_message_id:
-            if match.forum_thread_id:
-                # Thread message — just archive the thread
-                self._close_forum_thread(match.forum_thread_id, match.id)
-            elif config.esports_summary_channel_id:
-                # Channel message — delete it
+            if config.esports_summary_channel_id:
                 try:
                     channel = self.bot.get_channel(config.esports_summary_channel_id)
                     if channel:
@@ -3708,24 +3454,7 @@ class EsportsCog(commands.Cog):
                 del self.reminder_to_match[match.reminder_message_id]
             match.reminder_message_id = None
 
-        # Delete the summary-channel ping message (CS large-role workaround)
-        if match.ping_message_id:
-            try:
-                if config.esports_summary_channel_id:
-                    ch = self.bot.get_channel(config.esports_summary_channel_id)
-                    if ch:
-                        msg = await ch.fetch_message(match.ping_message_id)
-                        await msg.delete()
-                        self.log.info(f"Deleted ping message {match.ping_message_id} for match {match.id}")
-            except discord.NotFound:
-                self.log.debug(f"Ping message {match.ping_message_id} already deleted")
-            except Exception as e:
-                self.log.warning(f"Failed to delete ping message {match.ping_message_id}: {e}")
-            if match.ping_message_id in self.ping_to_match:
-                del self.ping_to_match[match.ping_message_id]
-            match.ping_message_id = None
-
-        # Delete the plain-text role ping sent right before the ping card
+        # Delete the plain-text role ping
         if match.ping_text_message_id:
             try:
                 if config.esports_summary_channel_id:
@@ -3743,7 +3472,42 @@ class EsportsCog(commands.Cog):
             match.ping_text_message_id = None
 
         await self._save_data()
-    
+
+    @app_commands.command(name="pingpreview", description="Preview the 30-minute reminder for the next match")
+    @app_commands.default_permissions(administrator=True)
+    async def pingpreview(self, interaction: discord.Interaction):
+        """Admin-only: render the reminder card for the next upcoming match as
+        an ephemeral message (no role ping, nothing posted publicly)."""
+        if not (interaction.user.guild_permissions and interaction.user.guild_permissions.administrator):
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
+
+        now = datetime.now(timezone.utc)
+        upcoming = [
+            m for m in self.matches.values()
+            if not m.cancelled and not m.has_ended and m.start_time > now
+        ]
+        if not upcoming:
+            await interaction.response.send_message("No upcoming match to preview.", ephemeral=True)
+            return
+
+        match = min(upcoming, key=lambda m: m.start_time)
+        # Building the versus image can take a moment (logo fetch) — defer first.
+        await interaction.response.defer(ephemeral=True)
+        try:
+            guild_id = interaction.guild.id if interaction.guild else config.esports_guild_id
+            versus_bytes = await self._build_reminder_media(match)
+            versus = versus_bytes is not None
+            view = build_reminder_view(match, guild_id, versus=versus)
+            if versus:
+                file = discord.File(io.BytesIO(versus_bytes), filename="versus.jpg")
+            else:
+                file = discord.File("resources/big.png", filename="big.png")
+            await interaction.followup.send(view=view, file=file)
+        except Exception as e:
+            self.log.error(f"Error building /pingpreview for match {match.id}: {e}")
+            await interaction.followup.send("❌ Could not build the reminder preview.", ephemeral=True)
+
 
 async def setup(bot: commands.Bot):
     if config.esports_enabled:

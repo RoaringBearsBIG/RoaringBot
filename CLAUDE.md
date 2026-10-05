@@ -87,14 +87,20 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   `_dedup_guild_events` läuft einmal pro Poll-Zyklus und löscht echte Duplikate
   (Name + Zeitfenster), behält das in `event_to_match` getrackte Event.
 
-**CS Livescore-Tracking:**
-- Startet 4–5 min vor jedem CS-Match automatisch (kein manueller Befehl).
+**Livescore-Tracking (CS/LoL/TM):**
+- Startet 4–5 min vor jedem CS-, LoL- und TM-Match automatisch (kein manueller
+  Befehl). Alle drei Games liefern im API-`matchmaps` pro Map ein binäres
+  Ergebnis (13:x), daher funktioniert `_compute_map_scores` für alle. Nur CS
+  bekommt die CV2-Score-Message mit Scorekeeper-Buttons; LoL/TM werden nur
+  getrackt, um den Live-Stand in den Discord-Event-Namen (Voice-Status) zu
+  schreiben.
 - **Belt-and-Suspenders**: `_check_for_starting_matches` startet Tracking auch für
   bereits gestartete (live), noch nicht getrackte Matches (`time_to_start < 240`,
   `not has_ended`, Relevance-Regel wie Health-Check) — deckt Restart-mitten-im-
   Match, spätes API-Discovery und Match-ID-Reuse ab. Ohne das wurde ein live
   Match nie getrackt → keine Scores, kein Event-Name-Update.
-- CV2-Score-Message mit Round-Score, Map-Tabelle, **Scorekeeper-Buttons**.
+- CV2-Score-Message mit Round-Score, Map-Tabelle, **Scorekeeper-Buttons**
+  (nur CS; LoL/TM haben keine Score-Message).
 - **Berechtigung**: Score-Buttons erlauben Admins UND User mit der Role
   `SCORE_UPDATE_ROLE_ID` (1278991041172602882) via `_can_manage_score()`;
   alle anderen sind read-only (Sep-2026: chrissimz wurde abgelehnt).
@@ -106,8 +112,10 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   sonst würden Score-Writes stillschweigend verworfen und der 30-s-Loop den
   lokalen Stand wieder zurücksetzen.
 - Der Voice-Event-Name zeigt den Live-Stand (`_update_event_name_with_score` /
-  `get_event_score_name`). Easter Egg: Score `7:1` (in dieser Reihenfolge) wird
-  als `bra71l` angezeigt statt `7:1`; alle anderen Scores bleiben normal.
+  `get_event_score_name`) für **alle drei Games** (CS/LoL/TM). CS zeigt
+  Round-Score + Maps (`3:4 (1:0)`); LoL/TM haben nur ein binäres Map-Ergebnis
+  und zeigen nur die Maps (`1:0`). Easter Egg (CS): Score `7:1` (in dieser
+  Reihenfolge) wird als `bra71l` angezeigt statt `7:1`; sonst normal.
 - 30-s `live_score_updater`-Loop synct von `/api/match_livescore/` und erkennt
   Finish → Winner-Rendering, Event beendet, Tracker entfernt.
 - **Main-Poll-has_ended-Fallback**: Der Livescore-Feed enthält Academy-Matches
@@ -158,43 +166,43 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   alarmiert (Aug-19-Storm).
 
 **30-Min-Reminder:**
-- Gefeuert im 29–30-Min-Fenster vor Kickoff. Forum-Thread mit Versus-Image
-  (`compose_versus_image` in `core/versus_image.py` — lokale reine
+- Gefeuert im 29–30-Min-Fenster vor Kickoff. **Eine CV2-Karte im Summary-Channel**
+  mit Versus-Image (`compose_versus_image` in `core/versus_image.py` — lokale reine
   Bild-Komposition, 2:1, JPEG quality 85, game-spezifische Hintergründe,
-  Schlagschatten, CS-Dreieck-Overlays). Game-Role-Ping **30 s verzögert**
-  (`REMINDER_PING_DELAY`) in separater Nachricht.
+  Schlagschatten, CS-Dreieck-Overlays). Es wird **kein** Match-Thread mehr
+  angelegt. Danach der Game-Role-Ping als **separate Plain-Text-Nachricht** im
+  selben Channel, **30 s verzögert** (`REMINDER_PING_DELAY`) — CV2 kann kein
+  `content` tragen, daher die separate Nachricht.
+- `/pingpreview` (admin-only, ephemeral) rendert die Reminder-Karte für das
+  nächste Match, ohne etwas öffentlich zu posten.
 - Opponent-Logo via images.weserv.nl-Proxy (HLTV-CDN blockt Server-IPs). Bei
   Proxy-Nicht-200 (z. B. Liquipedia blockt weserv) wird die Raw-URL direkt
   gefetcht (gleicher Direct-Fetch-Fallback wie `_build_event_cover_media`);
   erst wenn **beides** fehlschlägt → `None` → alte Two-Tile-Gallery
   (`big.png` + Opponent-Logo-URL).
-- **Ping-Card (CS-Large-Role-Workaround)**: CV2-Karte im Summary-Channel mit
-  "Match Thread"-Button, umgeht Discords 250-Member-Thread-Ping-Limit.
 - **Reschedule-in-die-Vergangenheit-Fallback**: Wurde ein Match auf einen
   **bereits vergangenen** Kickoff verschoben (Sep-2026: "BIG vs. G2" 09:00 →
   08:20, vom Bot erst ~5 min nach dem neuen Kickoff gesehen), ist das normale
-  T-30-Fenster unmöglich. `_check_for_match_reminders` sendet den Thread + Ping
+  T-30-Fenster unmöglich. `_check_for_match_reminders` sendet Reminder + Ping
   dann **sofort** nach — solange das Match noch plausibel live ist (nicht
   `has_ended`, Start < 4 h her, end_time-Grace wie Health-Check). Ohne das bliebe
-  ein solches Match dauerhaft ohne Thread/Ping.
+  ein solches Match dauerhaft ohne Reminder/Ping.
 - **Ende-Signal für den Reminder-Cleanup ist `has_ended`, nicht `end_time`**:
-  `_check_for_reminder_cleanup` löscht Reminder/Ping-Card nur bei `cancelled`,
+  `_check_for_reminder_cleanup` löscht Reminder + Ping nur bei `cancelled`,
   `has_ended` oder 4 h nach Start (Safety-Net). Das API-`end_time`/`last_map_end`
   ist nur eine grobe Schätzung, die **während eines laufenden Matches** bereits
   vorbeisein kann — ohne diesen Fix hätte ein Live-Match (Sep-2026: "BIG vs.
   G2", `last_map_end` 11:20Z, noch Map 3) seinen Reminder verloren und der
-  Reschedule-Fallback hätte jede Minute einen neuen Duplikat-Thread erzeugt.
+  Reschedule-Fallback hätte jede Minute einen neuen Duplikat-Reminder erzeugt.
   Der 4-h-Cap des Fallbacks ist bewusst deckungsgleich mit dem Cleanup-Safety-Net,
   damit es an der Grenze nie zu einem Ping-Pong kommt.
 - **Reschedule/Update**: `_edit_reminder_message` aktualisiert bei Time- oder
-  Opponent-Änderung **sowohl** die Thread-Nachricht (`reminder_message_id`) **als
-  auch** die Ping-Card (`ping_message_id`) und **benennt den Thread um**, falls
-  `team_a`/`team_b` sich geändert haben. Frisches `discord.File` pro Edit
-  (BytesIO-Streams sind nach dem ersten Edit verbraucht).
+  Opponent-Änderung die Summary-Reminder-Karte (`reminder_message_id`). Frisches
+  `discord.File` pro Edit (BytesIO-Streams sind nach dem ersten Edit verbraucht).
 - **Startup-Reconciliation**: `_reconcile_all_reminders` bringt nach dem ersten
-  Poll nach Restart alle existierenden Reminder/Ping-Cards/Thread-Titles auf den
-  aktuellen API-Stand — fängt Änderungen, die während Downtime/Crash passiert sind.
-- Reminder + Ping-Card werden automatisch gelöscht, wenn der Match endet
+  Poll nach Restart alle existierenden Reminder-Karten auf den aktuellen
+  API-Stand — fängt Änderungen, die während Downtime/Crash passiert sind.
+- Reminder + Ping werden automatisch gelöscht, wenn der Match endet
   (`_check_for_reminder_cleanup`). `_handle_match_finished` räumt den Reminder
   auch dann auf, wenn das Discord-Event schon beendet war (z. B. Livescore/API-
   Sync-Finish) — sonst bleiben verwaiste Ping-Einträge in den Maps zurück
@@ -338,4 +346,5 @@ Siehe `.env.example`. Kritische Besonderheiten:
 - `PING_CS` / `PING_LOL` / `PING_TM` — Game-spezifische Reminder-Ping-Roles.
 - `REMINDER_PING_DELAY` — Sekunden Verzögerung zwischen Reminder und Ping (Default 60, hardcoded in `esports.py`).
 - `BIRTHDAY_EMOTE_ID` — Nur die ID; der Emote-Name (`tabsSax`) ist hardcoded.
-- `ESPORTS_FORUM_CHANNEL_ID` — Fehlt → Reminder fallen zurück auf Summary-Channel.
+- `ESPORTS_FORUM_CHANNEL_ID` — **unbenutzt/veraltet**: Match-Threads wurden
+  entfernt; Reminder gehen immer in den Summary-Channel.
