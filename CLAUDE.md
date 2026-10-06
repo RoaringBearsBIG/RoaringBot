@@ -57,7 +57,11 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   die Creation wird nur für `has_ended`-Matches übersprungen (Sep-2026:
   "BIG Academy vs. Morrow" wurde nach spätem API-Discovery nie angelegt →
   dauerhafter Health-Error-Spam). Start wird auf now+30s geclampt, der Event
-  startet beim nächsten Poll automatisch.
+  startet beim nächsten Poll automatisch. Zusätzlich überspringt
+  `_event_window_passed` Matches, deren ganzes Event-Fenster (`_event_end_time`)
+  bereits in der Vergangenheit liegt — die API liefert manche beendete Matches
+  dauerhaft mit `has_ended=false` (Sep-2026: 2381/2384/2385), für die Discord
+  sonst jeden Poll mit 50035 "Cannot schedule event in the past" abweist.
 - Voice-Events wenn API `block_voice_channel` "VC 1"/"VC 2" + Env-Vars gesetzt.
   Eine API-Änderung von `block_voice_channel` (z. B. manuell "VC 2" → "VC 1")
   wird automatisch nachgezogen: `_match_needs_update` triggert dann

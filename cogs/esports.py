@@ -1532,10 +1532,14 @@ class EsportsCog(commands.Cog):
                         await self._edit_reminder_message(match)
                     # else: no reminder sent yet, will fire normally at 30-min mark
                     await self._update_discord_event(match)
-                elif not match.cancelled and not match.discord_event_id and not match.has_ended:
+                elif (not match.cancelled and not match.discord_event_id
+                      and not match.has_ended
+                      and not self._event_window_passed(match, datetime.now(timezone.utc))):
                     # Belt-and-suspenders: existing match lost its event (e.g., mapping cleared
                     # last cycle). Also covers matches that were already live when first
                     # discovered — _create_discord_event clamps the start to now+30s.
+                    # Stale matches whose window is already over are skipped entirely
+                    # (no recreate attempt, no duplicate-scan API call every poll).
                     self.log.info(f"Existing match {match_id} ({match.event_name}) has no Discord event — recreating")
                     await self._create_discord_event(match)
         
@@ -1596,6 +1600,15 @@ class EsportsCog(commands.Cog):
         by the CS live-score loop or the match disappearing from the API."""
         maps = max(match.bestof, 1)
         return match.start_time + timedelta(minutes=90) * maps + timedelta(minutes=90)
+
+    def _event_window_passed(self, match: "EsportsMatch", now: datetime) -> bool:
+        """True when a match's whole scheduled event window is already in the
+        past. The API keeps returning some finished matches with has_ended=false
+        long after kickoff (Sep-2026: 2381/2384/2385); creating an event for
+        them fails with Discord 50035 "Cannot schedule event in the past" and
+        would be retried every poll. Live/recently-started matches still pass
+        because their window extends past now."""
+        return self._event_end_time(match) <= now
 
     SCHEDULE_RECONCILE_TOLERANCE = timedelta(seconds=60)
     SCHEDULE_RECONCILE_MIN_LEAD = timedelta(minutes=2)
@@ -1837,6 +1850,13 @@ class EsportsCog(commands.Cog):
             # vs. Morrow" never got an event → permanent health-error spam).
             if match.has_ended:
                 self.log.debug(f"Skipping event creation for ended match {match.id}")
+                return
+            now = datetime.now(timezone.utc)
+            if self._event_window_passed(match, now):
+                self.log.debug(
+                    f"Skipping event creation for match {match.id} ({match.event_name}) "
+                    f"— scheduled window already in the past (kickoff {match.start_time.isoformat()})"
+                )
                 return
             event_start_time = self._event_api_start_time(match)
             end_time = self._event_end_time(match)
