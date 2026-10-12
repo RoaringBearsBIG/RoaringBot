@@ -120,15 +120,24 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   Round-Score + Maps (`3:4 (1:0)`); LoL/TM haben nur ein binäres Map-Ergebnis
   und zeigen nur die Maps (`1:0`). Easter Egg (CS): Score `7:1` (in dieser
   Reihenfolge) wird als `bra71l` angezeigt statt `7:1`; sonst normal.
+  `_start_cs_game_tracking` pusht den Initial-Stand sofort (`0:0`), sonst zeigt
+  der Name erst nach dem ersten Map-Wechsel einen Score — v. a. bei LoL/TM ohne
+  Score-Message sichtbar (Okt-2026: LoL 2395 zeigte beim Start keinen Stand).
 - 30-s `live_score_updater`-Loop synct von `/api/match_livescore/` und erkennt
-  Finish → Winner-Rendering, Event beendet, Tracker entfernt.
+  Finish → Winner-Rendering, Event beendet, Tracker entfernt. **Der Loop darf bei
+  leerem Feed nicht early-returnen** (`count: 0`, z. B. wenn kein CS live ist):
+  TM/LoL-Fixures stehen nie im Feed, der Per-Tracker-Fallback unten läuft dann
+  für alle Tracker. Sonst frieren TM-Tracker bei 0-0 ein und werden nie beendet
+  (Okt-2026: TM 2396/2398).
 - **Main-Poll-has_ended-Fallback**: Der Livescore-Feed enthält Academy-Matches
   oft gar nicht (Sep-2026: 2361/2365/2367 blieben ewig bei 0-0 hängen). Wenn ein
   getrackter Match im Feed fehlt, synct der Loop die Matchmaps aus dem
   `match_upcoming`-Poll (`_compute_map_scores`, enthält auch Final-Scores) und
   beendet den Tracker bei `has_ended=True` (geguardet: erst ≥ 15 min nach Start,
   damit ein verfrühtes has_ended keinen laufenden Match killt). Damit rendert das
-  Winner-State den echten Sieger (z. B. 0-2) statt "0-0".
+  Winner-State den echten Sieger (z. B. 0-2) statt "0-0". Der Fallback greift
+  **auch bei komplett leerem Feed** (siehe oben) — aber nicht, wenn der Match die
+  API ganz verlassen hat (`current is None`); solche Tracker bleiben stale.
 - **Cancelled-Cleanup**: `_handle_match_cancelled` + Startup-Sweep in
   `_process_match_updates` löschen Score-Message und Tracker für gecancelte
   Matches (`_remove_cs_tracker`) — sonst bliebe eine 0-0-Message ewig stehen.
