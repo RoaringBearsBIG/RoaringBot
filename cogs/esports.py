@@ -1141,8 +1141,13 @@ class EsportsCog(commands.Cog):
                 return
 
             matches_data = data.get("results", [])
-            if not matches_data:
-                return
+            # Do NOT bail when the feed is empty. The livescore feed only lists
+            # matches wannspieltbig is actively following, so it is routinely
+            # empty (no CS live) and never contains TM/LoL academy fixtures. The
+            # per-tracker loop below falls back to the main poll's matchmaps for
+            # exactly those matches; returning here silently froze every tracker
+            # at 0-0 (Oct-2026: TM matches 2396/2398 never showed a score in the
+            # voice-channel status and were never finished).
 
             now = datetime.now(timezone.utc)
 
@@ -3059,7 +3064,14 @@ class EsportsCog(commands.Cog):
             
             # Store tracker
             self.active_cs_games[match.id] = tracker
-            
+
+            # Push the initial score into the event name right away (0:0 for
+            # LoL/TM, 0:0 (0:0) for CS). Without this the name only gets the
+            # score after the first map result *changes* it, so an ongoing match
+            # shows a scoreless name until then — most visible for LoL/TM, which
+            # have no score message.
+            await self._update_event_name_with_score(tracker)
+
             self.log.info(f"Started {match.game.upper()} game tracking for match {match.id}: {match.event_name}")
             
         except Exception as e:
