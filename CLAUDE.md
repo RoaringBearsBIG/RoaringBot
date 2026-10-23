@@ -179,13 +179,16 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   alarmiert (Aug-19-Storm).
 
 **30-Min-Reminder:**
-- Gefeuert im 29–30-Min-Fenster vor Kickoff. **Eine CV2-Karte im Summary-Channel**
-  mit Versus-Image (`compose_versus_image` in `core/versus_image.py` — lokale reine
-  Bild-Komposition, 2:1, JPEG quality 85, game-spezifische Hintergründe,
-  Schlagschatten, CS-Dreieck-Overlays). Es wird **kein** Match-Thread mehr
-  angelegt. Danach der Game-Role-Ping als **separate Plain-Text-Nachricht** im
-  selben Channel, **30 s verzögert** (`REMINDER_PING_DELAY`) — CV2 kann kein
-  `content` tragen, daher die separate Nachricht.
+- Gefeuert im 29–30-Min-Fenster vor Kickoff. **Eine einzige CV2-Karte im
+  Summary-Channel** mit Versus-Image (`compose_versus_image` in
+  `core/versus_image.py` — lokale reine Bild-Komposition, 2:1, JPEG quality 85,
+  game-spezifische Hintergründe, Schlagschatten, CS-Dreieck-Overlays). Es wird
+  **kein** Match-Thread mehr angelegt. Der Game-Role-Ping ist ein **TextDisplay
+  in derselben Karte** (`build_reminder_view(..., mention=...)`), gesendet mit
+  `allowed_mentions=AllowedMentions(roles=True)`: CV2-Messages können kein
+  Top-Level-`content` tragen, aber Rollen-Mentions in einem TextDisplay pingen.
+  (Früher war der Ping eine separate Plain-Text-Nachricht, 30–60 s verzögert via
+  `REMINDER_PING_DELAY` — entfernt, damit Karte + Ping eine Nachricht sind.)
 - `/pingpreview` (admin-only, ephemeral) rendert die Reminder-Karte für das
   nächste Match, ohne etwas öffentlich zu posten.
 - Opponent-Logo via images.weserv.nl-Proxy (HLTV-CDN blockt Server-IPs). Bei
@@ -201,7 +204,7 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   `has_ended`, Start < 4 h her, end_time-Grace wie Health-Check). Ohne das bliebe
   ein solches Match dauerhaft ohne Reminder/Ping.
 - **Ende-Signal für den Reminder-Cleanup ist `has_ended`, nicht `end_time`**:
-  `_check_for_reminder_cleanup` löscht Reminder + Ping nur bei `cancelled`,
+  `_check_for_reminder_cleanup` löscht die Reminder-Karte (enthält den Ping) nur bei `cancelled`,
   `has_ended` oder 4 h nach Start (Safety-Net). Das API-`end_time`/`last_map_end`
   ist nur eine grobe Schätzung, die **während eines laufenden Matches** bereits
   vorbeisein kann — ohne diesen Fix hätte ein Live-Match (Sep-2026: "BIG vs.
@@ -215,7 +218,7 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 - **Startup-Reconciliation**: `_reconcile_all_reminders` bringt nach dem ersten
   Poll nach Restart alle existierenden Reminder-Karten auf den aktuellen
   API-Stand — fängt Änderungen, die während Downtime/Crash passiert sind.
-- Reminder + Ping werden automatisch gelöscht, wenn der Match endet
+- Die Reminder-Karte (inkl. Ping) wird automatisch gelöscht, wenn der Match endet
   (`_check_for_reminder_cleanup`). `_handle_match_finished` räumt den Reminder
   auch dann auf, wenn das Discord-Event schon beendet war (z. B. Livescore/API-
   Sync-Finish) — sonst bleiben verwaiste Ping-Einträge in den Maps zurück
@@ -362,7 +365,6 @@ Siehe `.env.example`. Kritische Besonderheiten:
 - `WSB_User` / `WSB_PW` — exakte Schreibweise! Basic Auth für wannspieltbig-API-PUTs.
 - `ESPORTS_VC1` / `ESPORTS_VC2` — Voice-Channel-IDs für "VC 1"/"VC 2"-Events.
 - `PING_CS` / `PING_LOL` / `PING_TM` — Game-spezifische Reminder-Ping-Roles.
-- `REMINDER_PING_DELAY` — Sekunden Verzögerung zwischen Reminder und Ping (Default 60, hardcoded in `esports.py`).
 - `BIRTHDAY_EMOTE_ID` — Nur die ID; der Emote-Name (`tabsSax`) ist hardcoded.
 - `ESPORTS_FORUM_CHANNEL_ID` — **unbenutzt/veraltet**: Match-Threads wurden
   entfernt; Reminder gehen immer in den Summary-Channel.

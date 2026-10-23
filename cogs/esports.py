@@ -3172,8 +3172,6 @@ class EsportsCog(commands.Cog):
         except Exception as e:
             self.log.error(f"Failed to send WhatsApp ping for match {match.id}: {e}")
 
-    REMINDER_PING_DELAY = 60  # seconds between reminder message and role ping
-
     async def _build_reminder_media(self, match: EsportsMatch) -> Optional[bytes]:
         """The composed 2:1 versus image for the reminder, or None when it
         can't be built (proxy failure for a known logo). A TBA placeholder is
@@ -3291,24 +3289,16 @@ class EsportsCog(commands.Cog):
             self.log.warning(f"Could not build event cover image for match {match.id}: {e}")
             return None
 
-    async def _send_delayed_ping(self, match: EsportsMatch, mention_text: str,
-                                 channel: discord.TextChannel):
-        """Post the game-role ping as a separate plain-text message in the
-        summary channel shortly after the reminder card. CV2 messages cannot
-        carry ``content``, so a plain message is needed to trigger the role
-        notification. The delay gives Discord a moment to settle the reminder
-        before pinging (users reported missing notifications otherwise)."""
-        try:
-            await asyncio.sleep(self.REMINDER_PING_DELAY)
-            msg = await channel.send(
-                content=mention_text,
-                allowed_mentions=discord.AllowedMentions(roles=True),
-            )
-            match.ping_text_message_id = msg.id
-            self.plain_ping_to_match[msg.id] = match.id
-            await self._save_data()
-        except Exception as e:
-            self.log.error(f"Failed to send delayed reminder ping for match {match.id}: {e}")
+    @staticmethod
+    def _ping_mention_text(match: EsportsMatch) -> str:
+        """The game-role mention rendered inside the reminder card ('' when no
+        role is configured)."""
+        role_id = {
+            "cs": config.ping_cs_role_id,
+            "lol": config.ping_lol_role_id,
+            "tm": config.ping_tm_role_id,
+        }.get(match.game)
+        return f"<@&{role_id}>" if role_id else ""
 
     async def _edit_reminder_message(self, match: EsportsMatch):
         """Edit the summary-channel reminder after a match update
@@ -3316,7 +3306,10 @@ class EsportsCog(commands.Cog):
         try:
             guild_id = config.esports_guild_id or (self.bot.guilds[0].id if self.bot.guilds else None)
             versus_bytes = await self._build_reminder_media(match)
-            view = build_reminder_view(match, guild_id, versus=versus_bytes is not None)
+            view = build_reminder_view(
+                match, guild_id, mention=self._ping_mention_text(match),
+                versus=versus_bytes is not None,
+            )
 
             channel = None
             if config.esports_summary_channel_id:
@@ -3334,7 +3327,10 @@ class EsportsCog(commands.Cog):
                     attachment = discord.File(io.BytesIO(versus_bytes), filename="versus.jpg")
                 else:
                     attachment = discord.File("resources/big.png", filename="big.png")
-                await message.edit(view=view, attachments=[attachment])
+                await message.edit(
+                    view=view, attachments=[attachment],
+                    allowed_mentions=discord.AllowedMentions(roles=True),
+                )
                 self.log.info(f"Edited reminder for updated match {match.id}: {match.event_name}")
             else:
                 # Message no longer exists — clear tracking so a fresh reminder fires at 30-min mark
@@ -3346,28 +3342,28 @@ class EsportsCog(commands.Cog):
             self.log.error(f"Error editing reminder for match {match.id}: {e}")
 
     async def _send_match_reminder(self, match: EsportsMatch, channel: discord.TextChannel):
-        """Send the 30-minute reminder as a CV2 card to the summary channel,
-        followed by a separate plain-text game-role ping (CV2 can't carry
-        content). No per-match thread is created anymore."""
+        """Send the 30-minute reminder as a single CV2 card to the summary
+        channel. The game-role ping is a Text Display inside the card: CV2
+        messages can't carry top-level ``content``, but role mentions inside a
+        Text Display do ping when ``allowed_mentions`` permits it. No per-match
+        thread is created anymore."""
         try:
-            ping_role_id = {
-                "cs": config.ping_cs_role_id,
-                "lol": config.ping_lol_role_id,
-                "tm": config.ping_tm_role_id,
-            }.get(match.game)
-            mention_text = f"<@&{ping_role_id}>" if ping_role_id else ""
+            mention_text = self._ping_mention_text(match)
 
             guild_id = channel.guild.id if channel.guild else config.esports_guild_id
             versus_bytes = await self._build_reminder_media(match)
             versus = versus_bytes is not None
-            view = build_reminder_view(match, guild_id, versus=versus)
+            view = build_reminder_view(match, guild_id, mention=mention_text, versus=versus)
 
             if versus:
                 file = discord.File(io.BytesIO(versus_bytes), filename="versus.jpg")
             else:
                 file = discord.File("resources/big.png", filename="big.png")
 
-            message = await channel.send(view=view, file=file)
+            message = await channel.send(
+                view=view, file=file,
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
             match.reminder_message_id = message.id
             self.reminder_to_match[message.id] = match.id
             await self._save_data()
@@ -3378,9 +3374,6 @@ class EsportsCog(commands.Cog):
                 last_reminder_sent_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 last_reminder_match=match.event_name,
             )
-
-            if mention_text:
-                asyncio.create_task(self._send_delayed_ping(match, mention_text, channel))
 
         except Exception as e:
             self.log.error(f"Error sending reminder for match {match.id}: {e}")
