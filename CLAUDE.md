@@ -304,6 +304,11 @@ Summary-Channel nutzt `config.share_base_url`.
 - Eigener Service-Account (`kassenbuch_credentials.json`). Täglicher Check um
   06:00 UTC, postet **nur am 1. des Monats** einen CV2-Kassenbericht für den
   Vormonat. Dashboard-Refresh alle 6 h. Deutsche Währungsformat-Parsing ("1.234,56 €").
+- `get_all_records()` wird mit `expected_headers=EXPECTED_HEADERS` aufgerufen.
+  Ohne das wirft gspread 6.x `... contains duplicates: ['']`, sobald das Sheet
+  unbenannte Hilfsspalten rechts der Kopfzeile hat (gspread padet die Kopfzeile
+  auf die volle Sheet-Breite → doppelte Leer-Header). Okt-2026: Sheet bekam
+  Spalten 13–17 ohne Labels → jeder 6-h-Status-Refresh schlug fehl.
 
 ## Status-Reporting
 

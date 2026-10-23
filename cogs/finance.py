@@ -25,6 +25,21 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 STATUS_REFRESH_HOURS = 6
 RECENT_DAYS = 90
 
+# Columns the cog reads from the Kassenbuch worksheet. Passed to
+# `get_all_records()` as `expected_headers` so the call keeps working when the
+# sheet grows extra unlabeled helper columns (e.g. category lookups): gspread
+# pads the header row to the full sheet width, and any trailing blank header
+# cells make it raise "the header row ... contains duplicates: ['']".
+EXPECTED_HEADERS = [
+    "Datum",
+    "Beleg-Nr",
+    "Einnahme",
+    "Ausgabe",
+    "Kategorie",
+    "Beschreibung / Kommentar",
+    "Saldo",
+]
+
 
 def _parse_amount(raw: str) -> Decimal:
     """Parse a German-formatted currency string ('1.234,56 €') into a Decimal."""
@@ -77,7 +92,7 @@ class FinanceCog(commands.Cog):
         ws = self.gc.open_by_key(config.kassenbuch_spreadsheet_id).worksheet(
             config.kassenbuch_worksheet_name
         )
-        rows = ws.get_all_records()
+        rows = ws.get_all_records(expected_headers=EXPECTED_HEADERS)
         entries = []
         for r in rows:
             try:
