@@ -133,11 +133,41 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   oft gar nicht (Sep-2026: 2361/2365/2367 blieben ewig bei 0-0 hängen). Wenn ein
   getrackter Match im Feed fehlt, synct der Loop die Matchmaps aus dem
   `match_upcoming`-Poll (`_compute_map_scores`, enthält auch Final-Scores) und
-  beendet den Tracker bei `has_ended=True` (geguardet: erst ≥ 15 min nach Start,
-  damit ein verfrühtes has_ended keinen laufenden Match killt). Damit rendert das
-  Winner-State den echten Sieger (z. B. 0-2) statt "0-0". Der Fallback greift
-  **auch bei komplett leerem Feed** (siehe oben) — aber nicht, wenn der Match die
-  API ganz verlassen hat (`current is None`); solche Tracker bleiben stale.
+  beendet den Tracker bei entschiedenem Map-Score + `has_ended=True` (geguardet:
+  erst ≥ 15 min nach Start). Damit rendert der Winner-State den echten Sieger
+  (z. B. 0-2) statt "0-0". Der Fallback greift **auch bei komplett leerem Feed**
+  (siehe oben) — aber nicht, wenn der Match die API ganz verlassen hat
+  (`current is None`); solche Tracker beendet der Abandoned-Guard nach 6 h.
+- **Manuelle Score-Edits sind vor dem 30-s-Sync geschützt**: Buttons/Modal
+  setzen `tracker.last_local_edit_at` und PUTen sofort auf die Site. Der
+  Main-Poll-Fallback verwirft seinen Snapshot (`self.matches`, nur 1×/Min
+  aktualisiert), solange er älter als der letzte lokale Edit ist
+  (`last_local_edit_at >= _matches_refreshed_at`) — sonst wurde ein gerade
+  eingetragener Score binnen Sekunden auf den Vor-PUT-Wert zurückgesetzt
+  (Okt-2026: Match 2400 sprang 4-7/11-6 → 0-0/6-5). Nach erfolgreichem PUT wird
+  der Timestamp erneut gestempelt (falls ein Poll während des Requests lief).
+  Übernommene Main-Poll-Änderungen werden jetzt geloggt.
+- **Finish nur bei entschiedenem Map-Score**: Beendet wird erst, wenn ein Team
+  `maps_to_win` ((bestof+1)//2) erreicht. `has_ended` allein ist unzuverlässig
+  (kippt vor dem Eintragen der letzten Map) — damit wurde ein Bo3 bei 1-1 als
+  "beendet" gewertet und ein Phantom-Sieger gerendert (Okt-2026: 2393
+  "Luminosity wins 1:1", 2404 "The Mongolz wins 1:1" bei echtem 1:2).
+  `build_score_container` krönt bei Gleichstand niemanden mehr, sondern zeigt
+  "Match ended · Maps 1:1".
+- **Abandoned-Guard**: Ein Tracker, dessen Match vor mehr als
+  `TRACKER_ABANDONED_AFTER` (6 h) startete und nie ein Endergebnis lieferte,
+  wird beendet/entfernt ("abandoned"). Sonst hing ein Match, das die API nie auf
+  `has_ended` setzt bzw. still verlässt, dauerhaft als "● live 0-0"-Message im
+  Channel (Okt-2026: 2381 seit 25. Sep, über einen Monat).
+- **Scorekeeper-Interaktionen ACKen vor dem Netzzugriff**: Die Callbacks
+  editieren die Message zuerst (schnelle ACK) und rufen erst danach
+  `_update_score_api`/`_update_event_name_with_score`; späte Fehler laufen über
+  `_send_interaction_error` (followup). Vorher sprengte ein langsamer PUT das
+  3-s-Interaction-Fenster → `404 10062 Unknown interaction` (Okt-2026: 12×/Tag).
+- **Letzte Karte bestätigt → sauberer Abschluss**: `MapConfirmationView` ruft bei
+  entschiedenem Match `_finish_cs_tracker` (Event beenden, Tracker entfernen).
+  Vorher blieb der fertige Tracker in `active_cs_games` hängen (Okt-2026: 2400
+  tauchte weiter im Dashboard auf).
 - **Cancelled-Cleanup**: `_handle_match_cancelled` + Startup-Sweep in
   `_process_match_updates` löschen Score-Message und Tracker für gecancelte
   Matches (`_remove_cs_tracker`) — sonst bliebe eine 0-0-Message ewig stehen.

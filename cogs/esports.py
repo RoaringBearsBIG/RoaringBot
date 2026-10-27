@@ -158,6 +158,10 @@ class CSGameTracker:
         # table: [{"map": 1, "name": "Mirage", "score": "13:9", "winner": "BIG"}].
         # Not persisted — the 30s livescore sync rebuilds it from the API.
         self.map_history: List[dict] = []
+        # When a scorekeeper edits the score locally (button/modal). The 30s
+        # loop compares this against the main-poll snapshot timestamp: applying
+        # a snapshot fetched before the edit would revert the manual update.
+        self.last_local_edit_at: Optional[datetime] = None
 
     def map_name(self, map_nr: int) -> Optional[str]:
         """Map name from the stored matchmaps data, if already known."""
@@ -277,6 +281,13 @@ GAME_EMOJI = {"cs": CS_EMOTE, "lol": "<:lol:1416235138307854416>", "tm": "🏎�
 # Role allowed to update live CS scores via the score-message buttons, in
 # addition to guild administrators. Everyone else is read-only.
 SCORE_UPDATE_ROLE_ID = 1278991041172602882
+
+# A tracker whose match started longer ago than this without ever producing a
+# final result is considered abandoned and is finalized/removed. Without it a
+# match the API never marks has_ended (or that silently leaves the API) keeps
+# refreshing a "live" 0-0 score message forever (Oct-2026: match 2381 since
+# Sep-25).
+TRACKER_ABANDONED_AFTER = timedelta(hours=6)
 
 
 def _compute_map_scores(matchmaps: List[dict], team_a: str, team_b: str):
@@ -458,8 +469,19 @@ def build_score_container(tracker: "CSGameTracker") -> discord.ui.Container:
         header += f" · [HLTV]({m.hltv_url})"
 
     if tracker.is_finished:
-        winner = m.team_a if tracker.team_a_maps > tracker.team_b_maps else m.team_b
-        title = f"## 🏆 {winner} wins!  ·  Maps {tracker.team_a_maps} : {tracker.team_b_maps}"
+        # Never crown a team on a tied map score: a Bo3 at 1:1 (or Bo5 at 2:2)
+        # has no winner. Previously any tie defaulted to team B, producing
+        # bogus "X wins! 1:1" messages (Oct-2026: 2393/2404).
+        if tracker.team_a_maps > tracker.team_b_maps:
+            winner: Optional[str] = m.team_a
+        elif tracker.team_b_maps > tracker.team_a_maps:
+            winner = m.team_b
+        else:
+            winner = None
+        if winner:
+            title = f"## 🏆 {winner} wins!  ·  Maps {tracker.team_a_maps} : {tracker.team_b_maps}"
+        else:
+            title = f"## Match ended  ·  Maps {tracker.team_a_maps} : {tracker.team_b_maps}"
     else:
         title = f"## {m.team_a}  {tracker.team_a_score} : {tracker.team_b_score}  {m.team_b}"
 
@@ -507,13 +529,25 @@ class MapConfirmationView(discord.ui.LayoutView):
         self.esports_cog.log.info(f"Button: {interaction.user} confirmed map {self.tracker.current_map} win for {self.winning_team} (match {self.tracker.match.id})")
         try:
             self.tracker._finalize_map_completion()
+            self.tracker.last_local_edit_at = datetime.now(timezone.utc)
+
+            # Acknowledge the click before the network round-trips: the PUT and
+            # event edit can exceed Discord's 3s interaction window.
+            await interaction.response.edit_message(view=ScoreUpdateView(self.tracker, self.esports_cog))
             await self.esports_cog._update_score_api(self.tracker)
             await self.esports_cog._update_event_name_with_score(self.tracker)
 
-            await interaction.response.edit_message(view=ScoreUpdateView(self.tracker, self.esports_cog))
+            if self.tracker.is_finished:
+                # Final map decided → end the Discord event and remove the
+                # tracker. Without this the finished tracker lingered in
+                # active_cs_games forever (Oct-2026: match 2400).
+                await self.esports_cog._finish_cs_tracker(
+                    self.tracker.match.id, self.tracker,
+                    "scorekeeper confirmed final map",
+                )
         except Exception as e:
             self.esports_cog.log.error(f"Button error (confirm_map, match {self.tracker.match.id}): {e}", exc_info=True)
-            await interaction.response.send_message(f"❌ Error confirming map: {e}", ephemeral=True)
+            await self.esports_cog._send_interaction_error(interaction, f"❌ Error confirming map: {e}")
 
     async def cancel_callback(self, interaction: discord.Interaction):
         """Cancel map confirmation and continue playing"""
@@ -524,6 +558,7 @@ class MapConfirmationView(discord.ui.LayoutView):
 
         self.esports_cog.log.info(f"Button: {interaction.user} cancelled map {self.tracker.current_map} confirmation (match {self.tracker.match.id}) - continuing play")
         self.tracker._revert_map_completion()
+        self.tracker.last_local_edit_at = datetime.now(timezone.utc)
 
         await interaction.response.edit_message(view=ScoreUpdateView(self.tracker, self.esports_cog))
 
@@ -575,17 +610,14 @@ class ManualScoreModal(discord.ui.Modal):
 
             self.tracker.team_a_score = team_a_rounds
             self.tracker.team_b_score = team_b_rounds
-            
+
             # Update overtime target based on new scores
             self.tracker._update_overtime_target()
-            
-            # Update API and event name
-            await self.esports_cog._update_score_api(self.tracker)
-            await self.esports_cog._update_event_name_with_score(self.tracker)
+            self.tracker.last_local_edit_at = datetime.now(timezone.utc)
 
             # Check if map is finished with new scores
             map_finished = self.tracker._check_map_winner()
-            
+
             if map_finished:
                 # Show confirmation view for map completion
                 winning_team = self.tracker.get_winning_team()
@@ -594,31 +626,27 @@ class ManualScoreModal(discord.ui.Modal):
                     self.tracker.team_a_maps += 1
                 elif winning_team == self.tracker.match.team_b:
                     self.tracker.team_b_maps += 1
-
                 view = MapConfirmationView(self.tracker, self.esports_cog, winning_team)
-                await interaction.response.edit_message(view=view)
-
-                # Send confirmation as followup
-                await interaction.followup.send(
-                    f"✅ Score updated: {old_team_a_score}-{old_team_b_score} → {team_a_rounds}-{team_b_rounds}\n🏆 {winning_team} reached winning score!",
-                    ephemeral=True
-                )
             else:
-                # Update the message with normal view
                 view = ScoreUpdateView(self.tracker, self.esports_cog)
-                await interaction.response.edit_message(view=view)
 
-                # Send confirmation as followup
-                await interaction.followup.send(
-                    f"✅ Score updated: {old_team_a_score}-{old_team_b_score} → {team_a_rounds}-{team_b_rounds}",
-                    ephemeral=True
-                )
-            
+            # Acknowledge before the API PUT/event edit, which can exceed the
+            # 3s interaction window (10x "Unknown interaction" in Oct-2026).
+            await interaction.response.edit_message(view=view)
+            await self.esports_cog._update_score_api(self.tracker)
+            await self.esports_cog._update_event_name_with_score(self.tracker)
+
+            # Send confirmation as followup
+            summary = f"✅ Score updated: {old_team_a_score}-{old_team_b_score} → {team_a_rounds}-{team_b_rounds}"
+            if map_finished:
+                summary += f"\n🏆 {winning_team} reached winning score!"
+            await interaction.followup.send(summary, ephemeral=True)
+
         except ValueError:
-            await interaction.response.send_message("❌ Please enter valid numbers for round scores.", ephemeral=True)
+            await self.esports_cog._send_interaction_error(interaction, "❌ Please enter valid numbers for round scores.")
         except Exception as e:
             self.esports_cog.log.error(f"Modal error (match {self.tracker.match.id}): {e}", exc_info=True)
-            await interaction.response.send_message(f"❌ Error updating score: {e}", ephemeral=True)
+            await self.esports_cog._send_interaction_error(interaction, f"❌ Error updating score: {e}")
 
 
 class ScoreUpdateView(discord.ui.LayoutView):
@@ -670,20 +698,23 @@ class ScoreUpdateView(discord.ui.LayoutView):
         self.esports_cog.log.info(f"Button: {interaction.user} added round for {self.tracker.match.team_a} (match {self.tracker.match.id}, map {self.tracker.current_map}, score {self.tracker.team_a_score}-{self.tracker.team_b_score})")
         try:
             map_finished = self.tracker.add_round_team_a()
-            await self.esports_cog._update_score_api(self.tracker)
-            await self.esports_cog._update_event_name_with_score(self.tracker)
+            self.tracker.last_local_edit_at = datetime.now(timezone.utc)
 
             if map_finished:
                 winning_team = self.tracker.get_winning_team()
                 if winning_team == self.tracker.match.team_a:
                     self.tracker.team_a_maps += 1
                 view = MapConfirmationView(self.tracker, self.esports_cog, winning_team)
-                await interaction.response.edit_message(view=view)
             else:
-                await interaction.response.edit_message(view=ScoreUpdateView(self.tracker, self.esports_cog))
+                view = ScoreUpdateView(self.tracker, self.esports_cog)
+
+            # Acknowledge before the network round-trips (see _update_score_api).
+            await interaction.response.edit_message(view=view)
+            await self.esports_cog._update_score_api(self.tracker)
+            await self.esports_cog._update_event_name_with_score(self.tracker)
         except Exception as e:
             self.esports_cog.log.error(f"Button error (team_a, match {self.tracker.match.id}): {e}", exc_info=True)
-            await interaction.response.send_message(f"❌ Error updating score: {e}", ephemeral=True)
+            await self.esports_cog._send_interaction_error(interaction, f"❌ Error updating score: {e}")
 
     async def team_b_callback(self, interaction: discord.Interaction):
         """Handle team B round win"""
@@ -695,20 +726,23 @@ class ScoreUpdateView(discord.ui.LayoutView):
         self.esports_cog.log.info(f"Button: {interaction.user} added round for {self.tracker.match.team_b} (match {self.tracker.match.id}, map {self.tracker.current_map}, score {self.tracker.team_a_score}-{self.tracker.team_b_score})")
         try:
             map_finished = self.tracker.add_round_team_b()
-            await self.esports_cog._update_score_api(self.tracker)
-            await self.esports_cog._update_event_name_with_score(self.tracker)
+            self.tracker.last_local_edit_at = datetime.now(timezone.utc)
 
             if map_finished:
                 winning_team = self.tracker.get_winning_team()
                 if winning_team == self.tracker.match.team_b:
                     self.tracker.team_b_maps += 1
                 view = MapConfirmationView(self.tracker, self.esports_cog, winning_team)
-                await interaction.response.edit_message(view=view)
             else:
-                await interaction.response.edit_message(view=ScoreUpdateView(self.tracker, self.esports_cog))
+                view = ScoreUpdateView(self.tracker, self.esports_cog)
+
+            # Acknowledge before the network round-trips (see _update_score_api).
+            await interaction.response.edit_message(view=view)
+            await self.esports_cog._update_score_api(self.tracker)
+            await self.esports_cog._update_event_name_with_score(self.tracker)
         except Exception as e:
             self.esports_cog.log.error(f"Button error (team_b, match {self.tracker.match.id}): {e}", exc_info=True)
-            await interaction.response.send_message(f"❌ Error updating score: {e}", ephemeral=True)
+            await self.esports_cog._send_interaction_error(interaction, f"❌ Error updating score: {e}")
 
     async def manual_score_callback(self, interaction: discord.Interaction):
         """Handle manual score input"""
@@ -746,6 +780,7 @@ class EsportsCog(commands.Cog):
 
         # CS game tracking
         self.active_cs_games: Dict[int, CSGameTracker] = {}  # match ID -> tracker
+        self._matches_refreshed_at: Optional[datetime] = None  # when self.matches was last replaced by a poll
         self.monitored_matches: Set[int] = set()  # Matches currently being monitored for start time
         self._pending_tracker_restore: Dict[int, dict] = {}  # Loaded from DB, applied after first API poll
         self._livescore_finished_ids: Set[int] = set()  # Match IDs finished via livescore sync; skip health checks until they leave the API
@@ -1153,6 +1188,17 @@ class EsportsCog(commands.Cog):
 
             # Update scores for active games
             for match_id, tracker in list(self.active_cs_games.items()):
+                # Abandoned-match guard: a tracker whose match started hours ago
+                # but never produced a final result would keep refreshing a
+                # "live" score message forever — the API can leave has_ended
+                # False indefinitely, or the match can silently drop out of the
+                # feed (Oct-2026: match 2381 since Sep-25).
+                if (not tracker.is_finished
+                        and now >= tracker.match.start_time + TRACKER_ABANDONED_AFTER):
+                    await self._finish_cs_tracker(
+                        match_id, tracker, "abandoned (no final result)")
+                    continue
+
                 # Find this match in API data
                 api_match = None
                 for m in matches_data:
@@ -1173,6 +1219,16 @@ class EsportsCog(commands.Cog):
                     if current is None:
                         continue
 
+                    # Skip while the snapshot predates a local (scorekeeper)
+                    # edit: the snapshot is only refreshed once per main poll, so
+                    # applying it right after a manual update would revert the
+                    # just-PUT score to its pre-edit value (Oct-2026: match 2400
+                    # bounced 4-7/11-6 back to 0-0/6-5).
+                    if (tracker.last_local_edit_at is not None
+                            and (self._matches_refreshed_at is None
+                                 or tracker.last_local_edit_at >= self._matches_refreshed_at)):
+                        continue
+
                     main_maps = _compute_map_scores(
                         current.matchmaps, current.team_a, current.team_b
                     )
@@ -1181,6 +1237,9 @@ class EsportsCog(commands.Cog):
                     if api_history:
                         tracker.map_history = api_history
                     if team_a_maps != tracker.team_a_maps or team_b_maps != tracker.team_b_maps:
+                        self.log.info(
+                            f"Match {match_id}: Map score updated from main poll - "
+                            f"{tracker.team_a_maps}-{tracker.team_b_maps} -> {team_a_maps}-{team_b_maps}")
                         tracker.team_a_maps = team_a_maps
                         tracker.team_b_maps = team_b_maps
                         scores_changed = True
@@ -1188,6 +1247,9 @@ class EsportsCog(commands.Cog):
                         api_map = current.matchmaps[current_map_idx]
                         new_map = current_map_idx + 1
                         if new_map != tracker.current_map:
+                            self.log.info(
+                                f"Match {match_id}: current map advanced from main poll - "
+                                f"{tracker.current_map} -> {new_map}")
                             tracker.current_map = new_map
                             tracker.team_a_score = 0
                             tracker.team_b_score = 0
@@ -1196,12 +1258,18 @@ class EsportsCog(commands.Cog):
                         a = api_map.get("rounds_won_team_a", 0) or 0
                         b = api_map.get("rounds_won_team_b", 0) or 0
                         if a != tracker.team_a_score or b != tracker.team_b_score:
+                            self.log.info(
+                                f"Match {match_id}: Round score updated from main poll - "
+                                f"Map {tracker.current_map}: "
+                                f"{tracker.team_a_score}-{tracker.team_b_score} -> {a}-{b}")
                             tracker.team_a_score = a
                             tracker.team_b_score = b
                             tracker._update_overtime_target()
                             scores_changed = True
 
-                    should_finish = (current.has_ended and not tracker.is_finished
+                    maps_to_win = (tracker.match.bestof + 1) // 2
+                    decided = (team_a_maps >= maps_to_win or team_b_maps >= maps_to_win)
+                    should_finish = (decided and current.has_ended and not tracker.is_finished
                                      and now >= current.start_time + timedelta(minutes=15))
                     if scores_changed or should_finish:
                         await self._update_event_name_with_score(tracker)
@@ -1218,9 +1286,6 @@ class EsportsCog(commands.Cog):
                             except Exception as e:
                                 self.log.error(f"Error updating score message: {e}")
                     continue
-
-                # Check if match has ended according to API
-                has_ended = api_match.get("has_ended", False)
 
                 # Get matchmaps from API
                 matchmaps = api_match.get("matchmaps", [])
@@ -1279,24 +1344,16 @@ class EsportsCog(commands.Cog):
                         status_reporter.bump_counter("esports", "score_updates_from_api")
                         scores_changed = True
 
-                # Check if match is finished — require actual map score to confirm,
-                # has_ended alone is unreliable (API sometimes sends it prematurely)
+                # Finalize only when a team actually reached the required map
+                # wins. `has_ended` alone is unreliable (it can flip before the
+                # deciding map's result is recorded), and a tied map score has
+                # no winner — treating it as finished produced bogus
+                # "X wins! 1:1" messages (Oct-2026: 2393/2404). Genuinely
+                # abandoned matches are swept by the age guard above.
                 maps_to_win = (tracker.match.bestof + 1) // 2
-                map_score_finished = tracker.team_a_maps >= maps_to_win or tracker.team_b_maps >= maps_to_win
-                maps_played = tracker.team_a_maps + tracker.team_b_maps > 0
-
-                # Fallback finish signal from the main match_upcoming poll: the
-                # livescore feed only covers matches wannspieltbig is actively
-                # following (academy fixtures are often absent entirely), so a
-                # match can end without ever syncing a map score here. Guard with
-                # a minimum live duration so a premature has_ended can't kill a
-                # match that hasn't really started.
-                current = self.matches.get(match_id)
-                main_poll_ended = (
-                    current is not None and current.has_ended
-                    and now >= current.start_time + timedelta(minutes=15)
-                )
-                match_finished = map_score_finished or (has_ended and maps_played) or main_poll_ended
+                map_score_finished = (tracker.team_a_maps >= maps_to_win
+                                      or tracker.team_b_maps >= maps_to_win)
+                match_finished = map_score_finished
 
                 # Update event name (all games) and score message (CS only) if
                 # scores changed or the match finished.
@@ -1308,10 +1365,7 @@ class EsportsCog(commands.Cog):
                         # until the match leaves the API (the event and
                         # tracker are already gone, so "no_discord_event"
                         # and "tracking_missing" would fire every poll).
-                        await self._finish_cs_tracker(
-                            match_id, tracker,
-                            "API sync" if map_score_finished or (has_ended and maps_played) else "main-poll has_ended",
-                        )
+                        await self._finish_cs_tracker(match_id, tracker, "API sync")
                     elif tracker.message_id:
                         try:
                             channel = self.bot.get_channel(config.esports_update_channel_id)
@@ -1550,6 +1604,7 @@ class EsportsCog(commands.Cog):
         
         # Update our local cache
         self.matches = current_matches
+        self._matches_refreshed_at = datetime.now(timezone.utc)
         await self._save_data()
 
         # Restore CS trackers from JSON after first API poll (matches are now populated)
@@ -2570,6 +2625,10 @@ class EsportsCog(commands.Cog):
             response = await http_client.put(url, json=update_data, headers=headers)
             try:
                 if response.status in [200, 204]:
+                    # Re-stamp after the PUT: a main poll may have completed
+                    # while the request was in flight, and its (pre-PUT)
+                    # snapshot must not be applied over this value.
+                    tracker.last_local_edit_at = datetime.now(timezone.utc)
                     self.log.info(f"Successfully updated scores for match {tracker.match.id}, map {tracker.current_map}")
                     status_reporter.bump_counter("esports", "score_updates_to_api")
                 else:
@@ -2619,6 +2678,19 @@ class EsportsCog(commands.Cog):
         if getattr(user, "guild_permissions", None) and user.guild_permissions.administrator:
             return True
         return any(r.id == SCORE_UPDATE_ROLE_ID for r in getattr(user, "roles", []))
+
+    @staticmethod
+    async def _send_interaction_error(interaction: discord.Interaction, message: str):
+        """Reply ephemerally whether or not the interaction was already
+        acknowledged. Score callbacks ACK before the API PUT, so a later error
+        must use a followup instead of a second response."""
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:
+            pass
 
     async def _check_for_starting_matches(self):
         """Check if any tracked-game matches are starting soon and create score
